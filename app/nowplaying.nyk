@@ -1,0 +1,252 @@
+-- The now-playing view: covers the content area with the blurred cover art,
+-- shows the big cover, title and artists on the left and the lyrics on the
+-- right. Synced lyrics follow the song (the active line stays a little above
+-- the middle, a click on a line seeks there, the wheel scrolls freely for a
+-- few seconds); plain lyrics just scroll.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local tokens = require("theme/tokens")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+local images = require("services/images")
+local lrc = require("services/lyrics/lrc")
+local lyrics = require("state/lyrics")
+local player = require("state/player")
+local playback = require("state/playback")
+
+local C = tokens.color
+local view = {}
+
+view.open = false
+
+local backdrop = { source = nil, image = nil }
+local layoutCache = { key = nil, lines = nil, total = 0 }
+local manualUntil = 0
+local manualScroll = 0
+
+-- How far the view is open (0..1); the shell skips drawing the page under it
+-- once it is fully open.
+function view.progress(): number
+    return anim.get("np:open") ?? 0
+end
+
+-- The cover, small and heavily blurred: stretched over the whole view it is a
+-- soft wash of the cover's colors. Painted into a canvas once per cover and
+-- size (stretching and tinting the full area every frame is the costly part).
+local function drawBackdrop(win: any, R: table)
+    local track = player.track
+    local small = track and images.get(track.thumbnails, 120)
+    if small and backdrop.source ~= small then
+        if backdrop.image then backdrop.image:close() end
+        backdrop.source = small
+        backdrop.image = small:blur(10)
+    end
+    local scale = win:scale()
+    local key = `{R.w}x{R.h}@{scale}|{track and backdrop.image and track.videoId}|{tokens.light}|{tokens.radius.panel}`
+    if backdrop.key ~= key then
+        if backdrop.canvas then backdrop.canvas:close() end
+        local c = ui.canvas(R.w, R.h, { scale = scale })
+        local r = tokens.radius.panel
+        local veil = tokens.light and 0xFFFFFF00 or 0x00000000
+        c:fillRect(0, 0, R.w, R.h, C.backdrop, { radius = r })
+        if backdrop.image and track then
+            c:drawImage(backdrop.image, 0, 0, { width = R.w, height = R.h, fit = "cover", radius = r, opacity = 0.75 })
+        end
+        c:fillRect(0, 0, R.w, R.h, 0x000000, { radius = r, gradient = {
+            angle = 90, stops = { { 0, veil + 0x66 }, { 0.6, veil + 0xA0 }, { 1, veil + 0xD0 } } } })
+        backdrop.canvas, backdrop.key = c, key
+    end
+    win:drawImage(backdrop.canvas, R.x, R.y)
+end
+
+-- Word-wrapped line heights for the lyrics column, cached per track and width.
+local LINE = { size = 25, font = nil, lineHeight = 1.25 }
+local GAP = 16
+
+local function layout(key: string, lines: {table}, w: number): table
+    if layoutCache.key == key then return layoutCache end
+    local out, y = {}, 0
+    for i, l in lines do
+        local text = (l.text == "") and "♪" or l.text
+        local _, h, n = ui.measureText(text, { size = LINE.size, font = fonts.bold, maxWidth = w, lineHeight = LINE.lineHeight })
+        out[i] = { y = y, h = h, text = text, single = n == 1 }
+        y += h + GAP
+    end
+    layoutCache = { key = key, lines = out, total = y }
+    return layoutCache
+end
+
+local function drawLyrics(win: any, x: number, y: number, w: number, h: number)
+    local track = player.track
+    local entry = lyrics.get(track)
+    if not entry then
+        win:text(x, y + 40, "Play something to see its lyrics here.", { size = 16, font = fonts.medium, color = C.textDim })
+        return
+    end
+    if entry.status == "loading" then
+        media.spinner(win, x + 24, y + 52)
+        win:text(x + 52, y + 43, "Looking for lyrics…", { size = 14, font = fonts.regular, color = C.textDim })
+        return
+    end
+    if entry.status ~= "ready" then
+        local msg = entry.instrumental and "This track is an instrumental." or "No lyrics found for this track."
+        win:text(x, y + 40, msg, { size = 18, font = fonts.semibold, color = C.textDim })
+        win:text(x, y + 70, "Shirabe looks on LRCLIB and YouTube Music.", { size = 13, font = fonts.regular, color = C.textFaint })
+        return
+    end
+    local value = entry.value
+    local lines = value.lines
+
+    -- Toolbar: source and (for synced lyrics) the timing offset.
+    local bar = value.synced and "Synced lyrics" or "Lyrics"
+    win:text(x, y, `{bar} · {value.source ?? "unknown source"}`, { size = 12, font = fonts.semibold, color = C.textFaint, letterSpacing = 0.3 })
+    if value.synced then
+        local off = value.offset ?? 0
+        local label = (off == 0) and "in sync" or string.format("%+.2f s", off)
+        local lw = ui.measureText(label, { size = 12, font = fonts.medium })
+        local bx = x + w - 28
+        if widgets.iconButton(win, "np:later", "plus", bx, y - 7, 26, { iconSize = 13 }).click then lyrics.nudge(track.videoId, 0.25) end
+        win:text(bx - 6, y - 1, label, { size = 12, font = fonts.medium, color = C.textDim, align = "right" })
+        if widgets.iconButton(win, "np:earlier", "minus", bx - lw - 40, y - 7, 26, { iconSize = 13 }).click then lyrics.nudge(track.videoId, -0.25) end
+    end
+
+    local top = y + 30
+    local viewH = h - 30
+    local L = layout(`{track.videoId}|{w}|{#lines}`, lines, w)
+    local maxScroll = math.max(0, L.total - viewH * 0.5)
+
+    -- Which line is playing (synced only), and where the view wants to be.
+    local now = playback.now() - (value.offset ?? 0)
+    local active = value.synced and lrc.active(lines, now) or 0
+    local over = input.inside and input.mx >= x - 20 and input.mx < x + w + 20 and input.my >= top and input.my < top + viewH
+    if over and input.scrollY ~= 0 then
+        local base = anim.get("np:lyricsScroll") ?? 0
+        if os.clock() > manualUntil then manualScroll = base end
+        manualScroll = math.clamp(manualScroll + input.scrollY, 0, maxScroll)
+        manualUntil = os.clock() + (value.synced and 3 or math.huge)
+    end
+    local target
+    if os.clock() < manualUntil then
+        target = manualScroll
+    elseif active > 0 then
+        local a = L.lines[active]
+        target = math.clamp(a.y + a.h / 2 - viewH * 0.38, 0, maxScroll)
+    else
+        target = 0
+    end
+    local scroll = anim.follow("np:lyricsScroll", target, 6, target)
+
+    win:pushClip(x - 12, top, w + 24, viewH)
+    for i, l in lines do
+        local box = L.lines[i]
+        local ly = top + box.y - scroll
+        if ly + box.h >= top - 40 and ly <= top + viewH + 40 then
+            local isActive = i == active
+            local glow = anim.follow(`np:line:{i}`, (isActive and 1 or 0), 10, 0)
+            local base = value.synced and ((i < active) and 0.32 or 0.45) or 0.8
+            local alpha = base + (1 - base) * glow
+            local opts = { size = LINE.size, font = fonts.bold, maxWidth = w, lineHeight = LINE.lineHeight }
+            local st = value.synced and l.t and input.hit(`np:seek:{i}`, x - 12, ly - GAP / 2, w + 24, box.h + GAP) or nil
+            if st and st.hover then
+                win:fillRect(x - 12, ly - GAP / 2 + 2, w + 24, box.h + GAP - 4, C.hover, { radius = 10 })
+                alpha = math.max(alpha, 0.75)
+            end
+            if isActive and l.words and box.single then
+                -- Word timing: brighten the line up to the current word.
+                opts.color = C.text
+                opts.opacity = 0.45
+                win:text(x, ly, box.text, opts)
+                local sung = ""
+                for _, word in l.words do
+                    if word.t <= now then sung ..= word.text end
+                end
+                local sw = ui.measureText(sung, { size = LINE.size, font = fonts.bold })
+                win:pushClip(x, ly, sw, box.h)
+                opts.opacity = 1
+                win:text(x, ly, box.text, opts)
+                win:popClip()
+            else
+                opts.color = C.text
+                opts.opacity = alpha
+                win:text(x, ly, box.text, opts)
+            end
+            if st and st.click then
+                playback.seek(math.max(0, l.t + (value.offset ?? 0)))
+                manualUntil = 0
+            end
+        end
+    end
+    win:popClip()
+    if value.synced and player.playing then anim.busy = true end
+end
+
+-- Draws the view over `R` (the content area). `reserve` is the width the
+-- queue panel takes at the right edge.
+function view.draw(win: any, R: table, ctx: table, reserve: number)
+    local p = anim.follow("np:open", (view.open and 1 or 0), 11, 0)
+    if p < 0.005 then return end
+    local shift = (1 - p) * 36
+    -- Fully open, it is drawn without an opacity group (a full-size layer).
+    local fading = p < 0.999
+    if fading then win:pushOpacity(p) end
+    local box = { x = R.x, y = R.y + shift, w = R.w, h = R.h }
+    -- Clicks and the wheel inside stop here (the page under it gets neither).
+    input.hit("np:backdrop", box.x, box.y, box.w, box.h, { cursor = false })
+    drawBackdrop(win, box)
+
+    local close = widgets.iconButton(win, "np:close", "chevronDown", box.x + 14, box.y + 8, 30, { iconSize = 18 })
+    if close.click then view.open = false end
+
+    local track = player.track
+    local padX, top = 40, box.y + 64
+    local avail = box.w - padX * 2 - reserve
+    local colW = math.floor(math.min(400, avail * 0.4))
+    local cover = math.floor(math.min(colW, box.h - 250))
+    local cx = box.x + padX + (colW - cover) / 2
+    if track then
+        media.art(win, track.thumbnails, cx, top, cover, cover, { radius = 14, kind = "song" })
+        local ty = top + cover + 22
+        local _, th = win:text(box.x + padX, ty, track.title, { size = 22, font = fonts.display, color = C.text,
+            maxWidth = colW, overflow = "ellipsis" })
+        ty += th + 6
+        -- Artists and album link to their pages.
+        local lx = box.x + padX
+        for i, a in track.artists ?? {} do
+            local name = a.name .. ((i < #track.artists) and ", " or "")
+            local nw = ui.measureText(name, { size = 15, font = fonts.medium })
+            if lx + nw > box.x + padX + colW then break end
+            local st = a.id and input.hit(`np:artist:{i}`, lx, ty, nw, 20) or nil
+            win:text(lx, ty, name, { size = 15, font = fonts.medium, color = (st and st.hover) and C.text or C.textDim })
+            if st and st.click then
+                view.open = false
+                ctx.open({ kind = "artist", browseId = a.id })
+            end
+            lx += nw
+        end
+        if track.album and track.album.name then
+            ty += 24
+            local st = track.album.id and input.hit("np:album", box.x + padX, ty, colW, 20) or nil
+            win:text(box.x + padX, ty, track.album.name, { size = 13.5, font = fonts.regular,
+                color = (st and st.hover) and C.text or C.textFaint, maxWidth = colW, overflow = "ellipsis" })
+            if st and st.click then
+                view.open = false
+                ctx.open({ kind = "album", browseId = track.album.id })
+            end
+        end
+    else
+        win:fillRect(cx, top, cover, cover, tokens.wash(0x10), { radius = 14 })
+        icons.draw(win, "lyrics", cx + cover / 2 - 24, top + cover / 2 - 24, 48, C.textFaint)
+        win:text(box.x + padX, top + cover + 22, "Nothing playing", { size = 22, font = fonts.display, color = C.textDim })
+    end
+
+    local lx = box.x + padX + colW + 56
+    local lw = box.x + box.w - padX - reserve - lx
+    if lw > 160 then drawLyrics(win, lx, top + 4, lw, box.h - (top - box.y) - 16) end
+    if fading then win:popOpacity() end
+end
+
+return view

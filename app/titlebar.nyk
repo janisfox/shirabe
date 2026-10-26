@@ -75,7 +75,7 @@ function titlebar.draw(win: any, L: table, onEdge: boolean)
         local hv = anim.follow(`{b.id}:hover`, (st.hover and 1 or 0), 22)
         if hv > 0.01 then
             local bg = b.id == "caption-close" and C.danger or C.hover
-            win:fillRect(bx, 0, S.caption, L.captions.h, ui.mixColor(bg & 0xFFFFFF00, bg, hv))
+            win:fillRect(bx, 0, S.caption, L.captions.h, ui.mixColor(bg & tokens.wash(0x00), bg, hv))
         end
         icons.draw(win, b.icon, bx + (S.caption - 16) / 2, (L.captions.h - 16) / 2, 16,
             ui.mixColor(C.textDim, C.text, hv), { width = 1.5 })

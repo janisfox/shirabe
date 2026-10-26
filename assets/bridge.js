@@ -12,6 +12,12 @@
     cfg: (key) => window.ytcfg?.get?.(key),
     player: () => document.getElementById("movie_player"),
     app: () => document.querySelector("ytmusic-app"),
+    video: () => document.querySelector("video"),
+    bar: () => document.querySelector("ytmusic-player-bar"),
+    // The play queue element; its redux store holds the queue (`queue` slice:
+    // items, automixItems, selectedItemIndex, repeatMode, shuffleEnabled).
+    queue: () => document.querySelector("ytmusic-player-queue#queue") ?? document.querySelector("#queue"),
+    queueState: () => YTM.queue()?.queue?.store?.store?.getState?.()?.queue ?? null,
   };
 
   // AUTH -------------------------------------------------------------------
@@ -102,6 +108,8 @@
       videoTime: document.querySelector("video")?.currentTime ?? null,
       videoDuration: document.querySelector("video")?.duration ?? null,
       muted: player.isMuted?.() ?? null,
+      rate: document.querySelector("video")?.playbackRate ?? null,
+      fxGraph: FX.nodes !== null,
     };
   };
 
@@ -190,6 +198,273 @@
     tick();
   };
 
+  // QUEUE --------------------------------------------------------------------
+
+  // YouTube Music's queue is the source of truth: Shirabe mirrors it from the
+  // store and changes it with the store's own actions (the ones the queue's
+  // drag and drop and menus use).
+  const queueRenderer = (item) =>
+    item?.playlistPanelVideoRenderer ?? item?.playlistPanelVideoWrapperRenderer?.primaryRenderer?.playlistPanelVideoRenderer ?? null;
+
+  // Only what the queue list shows (the store's entries carry menus and
+  // tracking data several kilobytes each).
+  const queueEntry = (item) => {
+    const r = queueRenderer(item);
+    if (!r) return null;
+    return { playlistPanelVideoRenderer: {
+      title: r.title, longBylineText: r.longBylineText, thumbnail: r.thumbnail, lengthText: r.lengthText,
+      videoId: r.videoId, selected: r.selected, playlistSetVideoId: r.playlistSetVideoId,
+      navigationEndpoint: r.navigationEndpoint, badges: r.badges,
+    } };
+  };
+
+  const queueSnapshot = () => {
+    const q = YTM.queueState();
+    if (!q) return null;
+    return {
+      items: (q.items ?? []).map(queueEntry),
+      automix: (q.automixItems ?? []).slice(0, 25).map(queueEntry),
+      selected: q.selectedItemIndex ?? null,
+      repeat: q.repeatMode ?? "NONE",
+      shuffle: q.shuffleEnabled === true,
+      autoplay: q.autoplay !== false,
+    };
+  };
+
+  const queueDispatch = (action) => {
+    const element = YTM.queue();
+    if (!element?.dispatch) throw new Error("the queue is not on the page");
+    element.dispatch(action);
+  };
+
+  // position: "next" (after the playing track) or "end".
+  const queueAdd = async ({ videoIds, position }) => {
+    const q = YTM.queueState();
+    if (!q) throw new Error("the queue is not on the page");
+    const app = YTM.app();
+    const response = await app.networkManager.fetch("/music/get_queue", {
+      queueContextParams: q.queueContextParams,
+      queueInsertPosition: position === "next" ? "INSERT_AFTER_CURRENT_VIDEO" : "INSERT_AT_END",
+      videoIds,
+    });
+    const items = (response?.queueDatas ?? []).map((d) => d?.content).filter(Boolean);
+    if (items.length === 0) throw new Error("YouTube Music returned no queue entries");
+    const now = YTM.queueState();
+    const length = now.items?.length ?? 0;
+    // An empty queue (nothing played yet) cannot take entries: play the first.
+    if (length === 0) return play({ videoId: videoIds[0] });
+    const index = position === "next" ? Math.min(length, (now.selectedItemIndex ?? -1) + 1) : length;
+    queueDispatch({ type: "ADD_ITEMS", payload: {
+      nextQueueItemId: now.nextQueueItemId, index, items, shuffleEnabled: false, shouldAssignIds: true,
+    } });
+    return items.length;
+  };
+
+  // Clicking an entry of YouTube Music's own queue.
+  const queuePlay = ({ index }) => {
+    queueDispatch({ type: "SET_INDEX", payload: index });
+    autoStartAny();
+  };
+
+  // Removes everything after the playing track.
+  const queueClear = () => {
+    const q = YTM.queueState();
+    if (!q) return 0;
+    const keep = (q.selectedItemIndex ?? 0) + 1;
+    let removed = 0;
+    for (let i = (q.items?.length ?? 0) - 1; i >= keep; i--) {
+      queueDispatch({ type: "REMOVE_ITEM", payload: i });
+      removed++;
+    }
+    return removed;
+  };
+
+  // repeat: "NONE" | "ALL" | "ONE"; the player bar's button cycles through them.
+  const setRepeat = ({ mode }) => {
+    const bar = YTM.bar();
+    for (let i = 0; i < 3 && bar && bar.repeatMode !== mode; i++) bar.onRepeatButtonClick();
+    return bar?.repeatMode ?? null;
+  };
+
+  const setShuffle = ({ on }) => {
+    const bar = YTM.bar();
+    if (bar && (bar.shuffleOn === true) !== !!on) bar.onShuffleButtonClick();
+    return bar?.shuffleOn ?? null;
+  };
+
+  // AUDIO FX -----------------------------------------------------------------
+
+  // The <video> is fed by MediaSource from the same origin, so its audio can
+  // be routed through Web Audio. The graph is built only once an effect is
+  // asked for (until then YouTube Music's own output path is untouched) and
+  // rebuilt when the page swaps the <video> element.
+  //   video -> [pitch shifter] -> EQ (10 bands) -> dry + reverb -> [compressor] -> pre-amp -> out
+  // The page's security policy blocks AudioWorklet modules, so the pitch
+  // shifter is a ScriptProcessor (a granular two-tap delay line).
+  const EQ_BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const FX = {
+    params: { speed: 1, pitch: 0, link: false, eq: EQ_BANDS.map(() => 0), reverb: 0, decay: 2.4, preDelay: 0.02,
+      loudness: false, preamp: 0, fade: 1 },
+    ctx: null, video: null, nodes: null, irKey: null,
+  };
+
+  const neutral = (p) => p.pitch === 0 && p.reverb === 0 && !p.loudness && p.preamp === 0 && p.fade === 1
+    && p.eq.every((g) => g === 0);
+
+  const makeShifter = (ctx) => {
+    const node = ctx.createScriptProcessor(2048, 2, 2);
+    const size = 16384, mask = size - 1;
+    const window = Math.round(ctx.sampleRate * 0.06);
+    const rings = [new Float32Array(size), new Float32Array(size)];
+    let write = 0, phase = 0;
+    node.ratio = 1;
+    const read = (ring, pos) => {
+      const i = Math.floor(pos), f = pos - i;
+      return ring[i & mask] * (1 - f) + ring[(i + 1) & mask] * f;
+    };
+    node.onaudioprocess = (event) => {
+      const input = event.inputBuffer, output = event.outputBuffer;
+      const n = input.length;
+      const channels = input.numberOfChannels;
+      const step = (1 - node.ratio) / window;
+      for (let c = 0; c < 2; c++) {
+        const src = input.getChannelData(Math.min(c, channels - 1));
+        const dst = output.getChannelData(c);
+        const ring = rings[c];
+        let ph = phase;
+        for (let i = 0; i < n; i++) {
+          const w = write + i;
+          ring[w & mask] = src[i];
+          const p2 = ph < 0.5 ? ph + 0.5 : ph - 0.5;
+          // Two taps half a window apart, crossfaded with sin² windows (they sum to 1).
+          const g1 = Math.sin(Math.PI * ph) ** 2;
+          dst[i] = read(ring, w - ph * window - 1) * g1 + read(ring, w - p2 * window - 1) * (1 - g1);
+          ph += step;
+          if (ph >= 1) ph -= 1; else if (ph < 0) ph += 1;
+        }
+        if (c === 1) phase = ph;
+      }
+      write = (write + n) & mask;
+    };
+    return node;
+  };
+
+  const impulse = (ctx, decay, preDelay) => {
+    const rate = ctx.sampleRate;
+    const length = Math.max(1, Math.round(rate * (decay + preDelay)));
+    const start = Math.round(rate * preDelay);
+    const buffer = ctx.createBuffer(2, length, rate);
+    for (let c = 0; c < 2; c++) {
+      const data = buffer.getChannelData(c);
+      for (let i = start; i < length; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - (i - start) / (length - start), 3.2);
+      }
+    }
+    return buffer;
+  };
+
+  const buildFx = (video) => {
+    FX.ctx = FX.ctx ?? new AudioContext({ latencyHint: "playback" });
+    const ctx = FX.ctx;
+    const n = {
+      source: ctx.createMediaElementSource(video),
+      shifter: makeShifter(ctx),
+      eq: EQ_BANDS.map((f, i) => {
+        const b = ctx.createBiquadFilter();
+        b.type = i === 0 ? "lowshelf" : (i === EQ_BANDS.length - 1 ? "highshelf" : "peaking");
+        b.frequency.value = f;
+        b.Q.value = 1.1;
+        return b;
+      }),
+      dry: ctx.createGain(),
+      convolver: ctx.createConvolver(),
+      wet: ctx.createGain(),
+      sum: ctx.createGain(),
+      compressor: ctx.createDynamicsCompressor(),
+      out: ctx.createGain(),
+    };
+    for (let i = 0; i < n.eq.length - 1; i++) n.eq[i].connect(n.eq[i + 1]);
+    const last = n.eq[n.eq.length - 1];
+    last.connect(n.dry);
+    last.connect(n.convolver);
+    n.convolver.connect(n.wet);
+    n.dry.connect(n.sum);
+    n.wet.connect(n.sum);
+    n.out.connect(ctx.destination);
+    const c = n.compressor;
+    c.threshold.value = -22; c.knee.value = 24; c.ratio.value = 3.5; c.attack.value = 0.004; c.release.value = 0.25;
+    FX.video = video;
+    FX.nodes = n;
+    FX.irKey = null;
+    FX.wired = null;
+  };
+
+  // Connects the optional stages (shifter, compressor) that are in use.
+  const wire = (p) => {
+    const n = FX.nodes;
+    const shift = p.pitch !== 0 && !p.link;
+    const key = `${shift}|${p.loudness}`;
+    if (FX.wired === key) return;
+    FX.wired = key;
+    for (const node of [n.source, n.shifter, n.sum, n.compressor]) node.disconnect();
+    if (shift) { n.source.connect(n.shifter); n.shifter.connect(n.eq[0]); } else n.source.connect(n.eq[0]);
+    if (p.loudness) { n.sum.connect(n.compressor); n.compressor.connect(n.out); } else n.sum.connect(n.out);
+  };
+
+  const applyFx = () => {
+    const p = FX.params;
+    const video = YTM.video();
+    if (!video) return;
+    // Speed is the element's own playback rate; "link" lets pitch follow it.
+    if (Math.abs(video.playbackRate - p.speed) > 0.001) video.playbackRate = p.speed;
+    if (video.preservesPitch !== !p.link) video.preservesPitch = !p.link;
+    if (!FX.nodes && neutral(p)) return;
+    if (!FX.nodes || FX.video !== video) buildFx(video);
+    if (FX.ctx.state === "suspended") FX.ctx.resume();
+    const n = FX.nodes;
+    const t = FX.ctx.currentTime;
+    wire(p);
+    n.shifter.ratio = Math.pow(2, p.pitch / 12);
+    let boost = 0;
+    p.eq.forEach((g, i) => { n.eq[i].gain.setTargetAtTime(g, t, 0.03); boost = Math.max(boost, g); });
+    const irKey = `${p.decay}|${p.preDelay}`;
+    if (p.reverb > 0 && FX.irKey !== irKey) {
+      n.convolver.buffer = impulse(FX.ctx, p.decay, p.preDelay);
+      FX.irKey = irKey;
+    }
+    // Equal-power wet / dry mix.
+    n.dry.gain.setTargetAtTime(Math.cos(p.reverb * Math.PI / 2), t, 0.03);
+    n.wet.gain.setTargetAtTime(Math.sin(p.reverb * Math.PI / 2) * 1.4, t, 0.03);
+    // Pre-amp, minus half the largest EQ boost as headroom, plus make-up gain
+    // for the compressor, times the sleep-timer fade.
+    const db = p.preamp - boost / 2 + (p.loudness ? 4 : 0);
+    n.out.gain.setTargetAtTime(Math.pow(10, db / 20) * p.fade, t, p.fadeTime ?? 0.03);
+  };
+
+  const fx = (params) => {
+    const p = FX.params;
+    for (const key of Object.keys(p)) {
+      if (params[key] === undefined) continue;
+      if (key === "eq") {
+        if (Array.isArray(params.eq)) p.eq = EQ_BANDS.map((_, i) => Math.max(-12, Math.min(12, Number(params.eq[i]) || 0)));
+      } else if (key === "link" || key === "loudness") {
+        p[key] = params[key] === true;
+      } else {
+        const v = Number(params[key]);
+        if (Number.isFinite(v)) p[key] = v;
+      }
+    }
+    p.speed = Math.max(0.5, Math.min(2, p.speed));
+    p.pitch = Math.max(-12, Math.min(12, p.pitch));
+    p.reverb = Math.max(0, Math.min(1, p.reverb));
+    p.decay = Math.max(0.3, Math.min(8, p.decay));
+    p.preDelay = Math.max(0, Math.min(0.2, p.preDelay));
+    p.fade = Math.max(0, Math.min(1, p.fade));
+    p.fadeTime = Number(params.fadeTime) || 0.03;
+    applyFx();
+    return { graph: FX.nodes !== null, state: FX.ctx?.state ?? null };
+  };
+
   // Runs an endpoint the page itself would run (e.g. selectActiveIdentityEndpoint).
   const command = (endpoint) => {
     dispatch("yt-navigate", { endpoint });
@@ -217,6 +492,15 @@
     command: ({ endpoint }) => command(endpoint),
     navigate: ({ url }) => location.assign(url),
     image: ({ url, maxBytes }) => image(url, maxBytes),
+    queue: () => queueSnapshot(),
+    queueAdd: (args) => queueAdd(args),
+    queuePlay: (args) => queuePlay(args),
+    queueRemove: ({ index }) => queueDispatch({ type: "REMOVE_ITEM", payload: index }),
+    queueMove: ({ from, to }) => queueDispatch({ type: "MOVE_ITEM", payload: { fromIndex: from, toIndex: to } }),
+    queueClear: () => queueClear(),
+    repeat: (args) => setRepeat(args),
+    shuffle: (args) => setShuffle(args),
+    fx: (params) => fx(params ?? {}),
   };
 
   window.addEventListener("neyuki", async (event) => {
@@ -251,13 +535,23 @@
   else announce();
 
   let last = "";
+  let lastQueue = null;
   setInterval(() => {
     if (silenced()) for (const video of document.querySelectorAll("video")) video.muted = true;
     const s = state();
     if (!s.ready) return;
     const key = `${s.videoId}|${s.playerState}|${Math.floor(s.position)}`;
-    if (key === last) return;
-    last = key;
-    post({ type: "state", ...s });
+    if (key !== last) {
+      last = key;
+      post({ type: "state", ...s });
+    }
+    // The store replaces its queue object on every change.
+    const q = YTM.queueState();
+    if (q && q !== lastQueue) {
+      lastQueue = q;
+      post({ type: "queue", ...queueSnapshot() });
+    }
+    // Keep the speed and the FX graph on whatever <video> the page uses now.
+    applyFx();
   }, 250);
 })();

@@ -1,0 +1,131 @@
+-- Popovers that open above the player bar: Audio FX (speed, pitch, link,
+-- sound presets, reverb, EQ preset, loudness) and volume. One is open at a
+-- time; a press outside it (but not on the player bar, whose buttons toggle
+-- them) closes it.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local widgets = require("kit/widgets")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local fonts = require("theme/fonts")
+local fx = require("state/fx")
+local player = require("state/player")
+local playback = require("state/playback")
+local settings = require("state/settings")
+
+local C = tokens.color
+local popovers = {}
+
+popovers.which = nil   -- nil | "fx" | "volume"
+local shown = nil      -- what is drawn while fading out
+
+function popovers.toggle(name: string)
+    popovers.which = (popovers.which == name) and nil or name
+end
+
+local function label(win: any, x: number, y: number, text: string, value: string?, w: number)
+    win:text(x, y, text, { size = 12.5, font = fonts.semibold, color = C.textDim })
+    if value then win:text(x + w, y, value, { size = 12.5, font = fonts.medium, color = C.text, align = "right" }) end
+end
+
+local function drawFx(win: any, x: number, y: number, w: number): number
+    local v = fx.values()
+    local ix, iw = x + 18, w - 36
+    local cy = y + 16
+    win:text(ix, cy, "Audio FX", { size = 16, font = fonts.display, color = C.text })
+    local rw = ui.measureText("Reset", { size = 12, font = fonts.semibold }) + 20
+    local rst = widgets.pill(win, "fxp:reset", "Reset", ix + iw - rw, cy - 3, { height = 24, size = 12, padX = 10 })
+    if rst.click then fx.reset() end
+    cy += 36
+
+    local mood = widgets.segmented(win, "fxp:mood", ix, cy, { "Normal", "Nightcore", "Slowed", "Daycore" }, fx.matching(fx.MOODS),
+        { size = 11.5, height = 26 })
+    if mood then fx.set(fx.MOODS[mood]) end
+    cy += 48
+
+    label(win, ix, cy, "Speed", string.format("%.2f×", v.speed), iw)
+    local speed, sst = widgets.slider(win, "fxp:speed", ix, cy + 28, iw, v.speed, 0.5, 2, { step = 0.01, default = 1 })
+    if sst.changed then v.speed = speed fx.changed() end
+    if sst.committed then fx.changed(true) end
+    cy += 50
+
+    local heard = fx.heardPitch()
+    label(win, ix, cy, v.link and "Pitch (follows speed)" or "Pitch", string.format("%+.1f st", heard), iw)
+    local pitch, pst = widgets.slider(win, "fxp:pitch", ix, cy + 28, iw, heard, -12, 12,
+        { step = 0.5, default = 0, color = v.link and C.textFaint or nil })
+    if pst.changed and not v.link then v.pitch = pitch fx.changed() end
+    if pst.committed and not v.link then fx.changed(true) end
+    cy += 50
+
+    win:text(ix, cy + 3, "Link pitch to speed", { size = 13, font = fonts.medium, color = C.text })
+    if widgets.toggle(win, "fxp:link", ix + iw - 40, cy, v.link).click then fx.set({ link = not v.link }) end
+    cy += 40
+
+    label(win, ix, cy, "Reverb", nil, iw)
+    cy += 24
+    local names = {}
+    for i, r in fx.REVERBS do names[i] = r.name end
+    local rv = widgets.segmented(win, "fxp:reverb", ix, cy, names, fx.matching(fx.REVERBS), { size = 11.5, height = 26 })
+    if rv then fx.set(fx.REVERBS[rv]) end
+    cy += 40
+    local mix, mst = widgets.slider(win, "fxp:mix", ix, cy + 6, iw, v.reverb, 0, 1, { step = 0.01, default = 0 })
+    if mst.changed then v.reverb = mix fx.changed() end
+    if mst.committed then fx.changed(true) end
+    cy += 28
+
+    label(win, ix, cy, "Equalizer", nil, iw)
+    cy += 24
+    local eqNames = {}
+    for i, e in fx.EQS do eqNames[i] = e.name end
+    local eq = widgets.segmented(win, "fxp:eq", ix, cy, eqNames, fx.matching(fx.EQS), { size = 11.5, height = 26 })
+    if eq then fx.set({ eq = table.clone(fx.EQS[eq].eq) }) end
+    cy += 44
+
+    win:text(ix, cy + 3, "Normalize loudness", { size = 13, font = fonts.medium, color = C.text })
+    if widgets.toggle(win, "fxp:loud", ix + iw - 40, cy, v.loudness).click then fx.set({ loudness = not v.loudness }) end
+    cy += 36
+    win:text(ix, cy, "More in Settings › Audio FX (each EQ band, pre-amp).", { size = 11.5, font = fonts.regular,
+        color = C.textFaint, maxWidth = iw })
+    return cy + 30 - y
+end
+
+local function drawVolume(win: any, x: number, y: number, w: number): number
+    local ix, iw = x + 16, w - 32
+    label(win, ix, y + 14, "Volume", string.format("%d%%", math.round(player.volume * 100)), iw)
+    local vol, st = widgets.slider(win, "vol:slider", ix, y + 46, iw, player.volume, 0, 1, { step = 0.01, default = 1 })
+    if st.changed then playback.setVolume(vol) end
+    if st.committed then
+        settings.values.playback.volume = player.volume
+        settings.save()
+    end
+    return 66
+end
+
+local sizes = { fx = 340, volume = 220 }
+local heights = { fx = 560, volume = 66 }
+
+-- anchors: playerbar.anchors; bar: the player bar's rectangle.
+function popovers.draw(win: any, anchors: table, bar: table)
+    local p = anim.follow("popover:open", (popovers.which and 1 or 0), 18, 0)
+    if popovers.which then shown = popovers.which end
+    if p < 0.01 or not shown then return end
+    local anchor = anchors[(shown == "fx") and "bar:fx" or "bar:volume"]
+    if not anchor then return end
+    local W, _ = win:size()
+    local w = sizes[shown]
+    local h = heights[shown]
+    local x = math.clamp(anchor.x - w / 2, 8, W - w - 8)
+    local y = anchor.y - h - 10 + (1 - p) * 8
+    local inside = input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h
+    local onBar = input.my >= bar.y and input.mx >= bar.x
+    if input.pressed and not inside and not onBar then popovers.which = nil end
+    win:pushOpacity(p)
+    glass.panel(win, x, y, w, h, { radius = 14, tint = C.popover, blur = 22 })
+    input.hit("popover:backdrop", x, y, w, h, { cursor = false })
+    if shown == "fx" then heights.fx = drawFx(win, x, y, w) else heights.volume = drawVolume(win, x, y, w) end
+    win:popOpacity()
+end
+
+return popovers

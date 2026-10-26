@@ -130,10 +130,10 @@ v1 pages (all decided):
 
 ### 3.2 Typography
 
-- Display (headings, page titles, big now-playing title): **Builder Extended** (Light/Regular/SemiBold/Bold/ExtraBold
-  in `assets/fonts`). Its licence file says "© Roblox Corporation. All rights reserved": fine for personal
-  builds, **check the licence before any public release**.
-- Body/UI: **Inter** (OFL; to be added to `assets/fonts`, static weights 400/500/600/700).
+- Display (headings, page titles, big now-playing title): **Montserrat Medium** (SemiBold for heavier titles), OFL,
+  in `assets/fonts` with its licence. It replaced Builder Extended (2026-10-26), whose licence ("© Roblox
+  Corporation. All rights reserved") ruled out distribution.
+- Body/UI: **Inter** (OFL, the 18 pt static cuts at 400/500/600/700 in `assets/fonts` with its licence).
 - Fallbacks via `ui.setFallbackFonts`: **Noto Sans JP** (+ KR/SC if needed, OFL), then the bundled Noto Sans.
   Monochrome emoji only.
 
@@ -260,7 +260,7 @@ shirabe/
     discord.nyk, media.nyk, images.nyk (thumbnail fetch + LRU cache), stats.nyk, sleep.nyk
   assets/
     bridge.js            injected into music.youtube.com
-    fonts/               BuilderExtended-*.otf, Inter-*.ttf, NotoSansJP-*.otf
+    fonts/               Montserrat-*.ttf (+ OFL), Inter-*.ttf, NotoSansJP-*.otf
     icons/               UI icons as PNG (rendered from SVG at 1×/2×)
     logos/               copied from .logos
   tests/                 parser tests against saved YTM JSON fixtures (no network)
@@ -327,7 +327,7 @@ field), `theme/` (tokens, fonts, vector icons, the logo drawn from its SVG pixel
 - Neyuki limits to remember: strings are UTF-8 only, so binary HTTP bodies and file writes are corrupted. Thumbnails
   must come through the bridge as base64 (`buffer.frombase64` → `ui.decodeImage`). `fs` paths (assets) resolve
   from the working directory, so run from the shirabe folder.
-- Fonts: Builder Extended (bundled) for display; Segoe UI stands in for Inter until the Inter files are added to
+- Fonts: Builder Extended (bundled at the time; replaced by Montserrat in milestone 5) for display; Segoe UI stands in for Inter until the Inter files are added to
   `assets/fonts`; CJK and emoji come from Yu Gothic UI, Malgun Gothic, YaHei and Segoe UI Emoji.
 
 ### 11.3 Milestone 3 results (2026-10-26)
@@ -373,12 +373,107 @@ field), `theme/` (tokens, fonts, vector icons, the logo drawn from its SVG pixel
   low-resolution thumbnail when that is all YTM offers; shuffle / repeat / lyrics / queue buttons only show a toast
   (milestone 5).
 
+### 11.5 Milestones 5–7 results (2026-10-26)
+
+**Milestone 5: now playing, lyrics, queue.**
+- **Queue** (`state/queue.nyk`, `app/queuepanel.nyk`): YouTube Music's own queue is mirrored from the page's redux
+  store (`ytmusic-player-queue#queue` → `queue.store.store.getState().queue`). The page pushes a trimmed copy whenever
+  the store's queue object changes. Changes use the store's own actions, all verified live with a probe
+  (`dev/probe.nyk`):
+  - `ADD_ITEMS` with entries from `music/get_queue`, through `app.networkManager.fetch`
+  - `MOVE_ITEM { fromIndex, toIndex }`
+  - `REMOVE_ITEM index`
+  - `SET_INDEX index`, which plays that entry
+
+  Shuffle and repeat go through the player bar's `onShuffleButtonClick` / `onRepeatButtonClick`; repeat cycles
+  NONE → ALL → ONE. The panel shows now playing, next up (click to play, drag to reorder, × to remove, Clear) and
+  autoplay's suggestions. Right-click menus on tracks, albums and playlists offer: Play next, Add to queue, Start
+  radio (`RDAMVM<videoId>`), Go to artist / album.
+- **Lyrics** (`services/lyrics/`, `state/lyrics.nyk`):
+  - The web client's lyrics are plain text, and asking as `ANDROID_MUSIC` from the page fails (HTTP 400). So the
+    chain is LRCLIB synced → YouTube Music plain → LRCLIB plain.
+  - Results are cached per video in `cacheDir/lyrics`, with a per-track offset (±0.25 s buttons).
+  - The LRC parser handles multiple time tags, `[offset]` and enhanced word tags; it is covered by `tests/test_lrc.nyk`.
+  - Neyuki's HTTPS failed for lrclib.net ("unable to find any user-specified roots"). The fix is on branch
+    `fix/http-platform-roots` (see below).
+- **Now playing** (`app/nowplaying.nyk`): a blurred-cover backdrop (cached in a canvas), the big cover, title,
+  artists and album (links), and synced lyrics. The active line sits at 38 % height and the scroll glides. Word
+  tags light up word by word, a click on a line seeks there, and the wheel scrolls freely for 3 s. The position
+  between the page's state reports is extrapolated (`playback.now()`). Opened from the player bar's cover or title,
+  the lyrics button, or F11; Esc closes it.
+- Verified live with `dev/flows/m5-nowplaying.txt`: synced lyrics from LRCLIB, seeking from a line, the queue with
+  autoplay entries, the context menu, the FX and volume popovers, Escape order.
+
+**Milestone 6: audio FX** (`state/fx.nyk`, `app/popovers.nyk`, `assets/bridge.js` "AUDIO FX").
+- The `<video>` (MediaSource, same origin) is routed through Web Audio:
+  `source → [pitch shifter] → 10-band EQ → dry + convolver reverb → [compressor] → pre-amp → out`.
+  - The graph is built only once an effect is non-neutral, and rebuilt when the page swaps its `<video>`.
+  - Speed is `video.playbackRate`, re-applied every 250 ms because the player resets it; "link" turns off
+    `preservesPitch`.
+  - The page's CSP blocks AudioWorklet modules (both blob: and data: URLs), so the pitch shifter is a
+    ScriptProcessor running a two-tap granular delay line with sin² crossfades.
+- Presets: Normal / Nightcore / Slowed + reverb / Daycore; reverb Off / Room / Hall / Cathedral; EQ Flat / Bass /
+  Vocal / Treble / Loudness. Half the largest EQ boost is taken off the pre-amp as headroom.
+- Settings persist (`settings.fx`) and are sent again whenever the page reloads.
+- Verified live: Nightcore set the page's rate to 1.25, Hall built the graph (the AudioContext runs in the hidden
+  window), Reset returned to 1.0. The effects haven't been listened to, because test runs are muted.
+
+**Milestone 7: settings, customization, accounts** (`app/settings.nyk`, `theme/appearance.nyk`).
+- A modal with search over every row (label, description, keywords). Sections:
+  - **Playback:** volume, shortcuts.
+  - **Audio FX:** everything, including each EQ band, pre-amp, decay, pre-delay.
+  - **Appearance:** text tone, accent from the cover or custom (swatches + hex), glass opacity, corner radius.
+  - **Background:** default / color / gradient / image (drop a file) / cover art; blur, dim, animate.
+  - **YouTube Music:** accounts with Switch, sign in / out, show the hidden page.
+  - **Storage:** lyrics cache, paths.
+  - **About.**
+- Text tones are two palettes in `tokens.palettes`, and every translucent overlay goes through `tokens.wash()`, so
+  the light tone flips them too. The cover accent is the most vivid pixel of a 12 × 12 reduction, lightened or
+  deepened until it reads, and it glides between tracks.
+- The account popover got "Manage accounts…". Sign out (`view:clearData()`) is implemented but **not exercised**:
+  it would sign the owner out.
+
+**Fonts:** Builder Extended was removed for its licence; headings use Montserrat Medium/SemiBold and body text
+Inter, both OFL.
+
+**Performance.** Real-data pages cost 20–50 ms per frame (the M2 numbers were measured on placeholder pages).
+Measured with `dev/bench.nyk` and `SHIRABE_PROF=1`, the causes were:
+- Drawing a window-sized canvas: 15 ms, because canvases were always alpha-blended.
+- Drawing a 172 px image: 0.45 ms. tiny-skia's general float pipeline costs about 15 ns per pixel.
+- `blurRegion` on a 1000 × 66 strip: 39 ms.
+- Icons rebuilt their vector paths every frame.
+- Every visible card picked its artwork URL with string scans every frame.
+
+Fixes:
+- **Shirabe:** caches icons, the logo and artwork URLs, and blurs only panels whose tint is see-through
+  (`glass.panel`).
+- **Neyuki branch `perf/ui-blur-and-canvas`:**
+  - opaque canvases are copied
+  - wide blurs run on a 2–8× reduced copy
+  - images, opacity groups and pixel-aligned flat fills go through an integer source-over compositor, with
+    rounded corners from cached masks
+
+After the fixes:
+
+| | before | after |
+|---|---|---|
+| Full-window canvas | 15 ms | 0.4 ms |
+| 172 px image | 0.45 ms | 0.06 ms |
+| Blur strip | 39 ms | 12 ms |
+| Frame work (home, search, library, now playing, queue, settings) | 25–50 ms | 3–14 ms, so 60 fps |
+
+`SHIRABE_DEBUG_FRAMES=1` prints each frame's work time.
+
+**Testing safety:** `SHIRABE_TEST_NOPLAY=1` makes the bridge refuse anything that plays, navigates the page or
+writes to the account. Scripted runs that are not meant to play must use it: a mis-aimed click played tracks into
+the brand account's history three times this session.
+
 ## 12. Known risks
 
 - ~~Google sign-in blocked in the embedded webview~~: worked in milestone 1, but Google can change this at any time.
 - YTM DOM/internal API changes break the bridge. Keep it isolated, self-testing and easy to patch.
 - CPU rendering cost at high resolution with blur + GIF. Use the caching rules in §3.1 and measure with `ui.stats()`.
-- Builder Extended licence for public distribution.
-- Shirabe needs Neyuki ≥ 0.6.1 plus neyuki-lang PR #40 (GC sparing fix): 0.6.0 re-runs a file module on every `require` (so modules never share state) and
+- Shirabe needs Neyuki ≥ 0.6.2, plus (until released) `fix/http-platform-roots` for LRCLIB lyrics and
+  `perf/ui-blur-and-canvas` for 60 fps. Older versions: 0.6.0 re-runs a file module on every `require` (so modules never share state) and
   parses `??` tighter than the spec. 0.5.0 crashes on the next full GC once any self-recursive closure exists, and its
   windows-gnu builds don't start without `WebView2Loader.dll`.

@@ -21,7 +21,7 @@ function widgets.iconButton(target: any, id: any, icon: string, x: number, y: nu
     local h = anim.follow(`{id}:hover`, (state.hover and 1 or 0), tokens.motion.hoverRate)
     local p = anim.follow(`{id}:press`, (state.held and 1 or 0), 30)
     if o.hoverBg ~= false and h > 0.01 then
-        target:fillRect(x, y, size, size, ui.mixColor(0xFFFFFF00, C.hover, h), { radius = o.radius ?? tokens.radius.button })
+        target:fillRect(x, y, size, size, ui.mixColor(tokens.wash(0x00), C.hover, h), { radius = o.radius ?? tokens.radius.button })
     end
     local iconSize = (o.iconSize ?? (size * 0.55)) * (1 - p * 0.08)
     local base = o.color ?? ((o.active and C.text) or C.textDim)
@@ -46,7 +46,7 @@ function widgets.pill(target: any, id: any, label: string, x: number, y: number,
     local state = input.hit(id, x, y, w, h)
     local hv = anim.follow(`{id}:hover`, (state.hover and 1 or 0), tokens.motion.hoverRate)
     local strong = o.primary or o.selected
-    local bg = strong and ui.mixColor(C.surfaceActive, 0xFFFFFFFF, hv * 0.5)
+    local bg = strong and ui.mixColor(C.surfaceActive, tokens.wash(0xFF), hv * 0.5)
         or ui.mixColor(C.surface, C.surfaceHover, hv)
     local fg = strong and C.textOnActive or C.text
     if not o.noBackground then
@@ -59,6 +59,107 @@ function widgets.pill(target: any, id: any, label: string, x: number, y: number,
     end
     target:text(tx, y + (h - size * 1.25) / 2, label, { size = size, font = font, color = fg })
     return state, w
+end
+
+-- CONTROLS -------------------------------------------------------------------
+
+local dragging = {}   -- slider id -> true while its drag lasts
+
+-- A horizontal slider. Returns the (possibly changed) value and the hit state
+-- (`state.changed` while it moves, `state.committed` when the drag ends).
+--   options: step, default (double-click resets to it), color (fill), h (hit height)
+function widgets.slider(target: any, id: any, x: number, y: number, w: number, value: number,
+    min: number, max: number, options: table?): (number, table)
+    local o = options ?? {}
+    local h = o.h ?? 20
+    local state = input.hit(id, x - 8, y - h / 2, w + 16, h)
+    local v = value
+    state.changed, state.committed = false, false
+    if state.double and o.default ~= nil then
+        v = o.default
+        state.changed, state.committed = true, true
+    elseif state.held then
+        local frac = math.clamp((input.mx - x) / w, 0, 1)
+        v = min + frac * (max - min)
+        if o.step then v = math.round(v / o.step) * o.step end
+        v = math.clamp(v, min, max)
+        state.changed = v ~= value
+    end
+    if state.held then
+        dragging[id] = true
+    elseif dragging[id] then
+        dragging[id] = nil
+        state.committed = true
+    end
+    local hv = anim.follow(`{id}:hover`, ((state.hover or state.held) and 1 or 0), tokens.motion.hoverRate)
+    local frac = (max > min) and math.clamp((v - min) / (max - min), 0, 1) or 0
+    local th = 4
+    target:fillRect(x, y - th / 2, w, th, tokens.wash(0x22), { radius = th / 2 })
+    -- Sliders around a zero in the middle (EQ, pitch) fill from that zero.
+    local zero = (min < 0 and max > 0) and ((0 - min) / (max - min)) or 0
+    local a, b = math.min(zero, frac), math.max(zero, frac)
+    local fill = o.color ?? C.accent
+    if b > a then target:fillRect(x + w * a, y - th / 2, w * (b - a), th, fill, { radius = th / 2 }) end
+    local r = 6 + hv * 1.5
+    target:circle(x + w * frac, y, r, C.text, { shadow = { blur = 6, offsetY = 1, color = 0x00000066 } })
+    return v, state
+end
+
+-- An on / off switch (40 x 22). Returns the hit state; the caller flips the value on click.
+function widgets.toggle(target: any, id: any, x: number, y: number, on: boolean): table
+    local state = input.hit(id, x, y, 40, 22)
+    local p = anim.follow(`{id}:on`, (on and 1 or 0), 16)
+    local track = ui.mixColor(tokens.wash(0x26), C.accent, p)
+    target:fillRect(x, y, 40, 22, track, { radius = 11 })
+    local knob = ui.mixColor(C.text, C.textOnAccent, p)
+    target:circle(x + 11 + p * 18, y + 11, 8, knob, { shadow = { blur = 4, offsetY = 1, color = 0x00000055 } })
+    return state
+end
+
+-- The width `segmented` takes for `labels`.
+function widgets.segmentedWidth(labels: {string}, options: table?): number
+    local size = (options and options.size) ?? 12.5
+    local total = 6
+    for _, label in labels do total += ui.measureText(label, { size = size, font = fonts.semibold }) + 22 end
+    return total
+end
+
+-- A row of mutually exclusive choices with a sliding highlight. Returns the
+-- index clicked this frame (or nil) and the width used.
+--   options: size, height
+function widgets.segmented(target: any, id: any, x: number, y: number, labels: {string}, selected: number?,
+    options: table?): (number?, number)
+    local o = options ?? {}
+    local size = o.size ?? 12.5
+    local h = o.height ?? 30
+    local font = fonts.semibold
+    local widths, total = {}, 0
+    for i, label in labels do
+        widths[i] = ui.measureText(label, { size = size, font = font }) + 22
+        total += widths[i]
+    end
+    target:fillRect(x, y, total + 6, h + 6, C.surface, { radius = (h + 6) / 2 })
+    local sx = x + 3
+    local selX, selW = sx, widths[1] ?? 0
+    local cx = sx
+    for i = 1, #labels do
+        if i == selected then selX, selW = cx, widths[i] end
+        cx += widths[i]
+    end
+    local px = anim.follow(`{id}:x`, selX, tokens.motion.pillRate, selX)
+    local pw = anim.follow(`{id}:w`, selW, tokens.motion.pillRate, selW)
+    if selected then target:fillRect(px, y + 3, pw, h, C.surfaceActive, { radius = h / 2 }) end
+    local clicked = nil
+    cx = sx
+    for i, label in labels do
+        local st = input.hit(`{id}:{i}`, cx, y + 3, widths[i], h)
+        if st.click then clicked = i end
+        local active = i == selected
+        local color = active and C.textOnActive or (st.hover and C.text or C.textDim)
+        target:text(cx + widths[i] / 2, y + 3 + (h - size * 1.25) / 2, label, { size = size, font = font, color = color, align = "center" })
+        cx += widths[i]
+    end
+    return clicked, total + 6
 end
 
 -- SINGLE-LINE TEXT FIELD ------------------------------------------------------
@@ -138,7 +239,7 @@ function widgets.textField(target: any, id: any, x: number, y: number, w: number
     local hv = anim.follow(`{id}:hover`, ((state.hover or has) and 1 or 0), tokens.motion.hoverRate)
     target:fillRect(x, y, w, h, ui.mixColor(C.surface, C.surfaceHover, hv), { radius = o.radius ?? tokens.radius.chip })
     if has then
-        target:strokeRect(x + 0.5, y + 0.5, w - 1, h - 1, 0xFFFFFF40, { radius = o.radius ?? tokens.radius.chip, width = 1 })
+        target:strokeRect(x + 0.5, y + 0.5, w - 1, h - 1, tokens.wash(0x40), { radius = o.radius ?? tokens.radius.chip, width = 1 })
     end
 
     local size = o.size ?? 13.5

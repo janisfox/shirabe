@@ -32,9 +32,24 @@ local function snap(win: any, name: string)
     print("snap", name)
 end
 
+local sized = false
+
 -- Synthetic input events for this frame.
 function harness.events(win: any, dt: number): {table}
     if not devScript then return {} end
+    -- Scripts click at fixed coordinates: make sure the window has the size
+    -- they were written for (it may open maximized or snapped).
+    if not sized then
+        sized = true
+        if win:isMaximized() then win:restore() end
+        win:setSize(1280, 800)
+    end
+    local w, h = win:size()
+    if w ~= 1280 or h ~= 800 then
+        if win:isMaximized() then win:restore() end
+        win:setSize(1280, 800)
+        return {}
+    end
     local out = devScript.step(dt, function(name) snap(win, name) end, function() win:close() end)
     for _, e in out do e.window = win end
     return out

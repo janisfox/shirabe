@@ -1,0 +1,208 @@
+-- The queue panel: slides in from the right edge of the content area (over a
+-- page or the now-playing view). It shows the playing track, what comes next
+-- (click to play, drag to reorder, x to remove) and autoplay's suggestions.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local fonts = require("theme/fonts")
+local queue = require("state/queue")
+local player = require("state/player")
+
+local C = tokens.color
+local panel = {}
+
+panel.open = false
+panel.WIDTH = 360
+
+local ROW = 54
+local scrollTarget = 0
+local drag = nil       -- { index, startY, offsetY, active }
+
+local function row(win: any, id: string, item: table, x: number, y: number, w: number, options: table): table
+    local st = input.hit(id, x, y, w, ROW)
+    local hv = anim.follow(`{id}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
+    local bg = options.playing and tokens.wash(0x1C) or ui.mixColor(tokens.wash(0x00), C.hover, hv)
+    if options.lifted then bg = tokens.wash(0x2A) end
+    if bg ~= tokens.wash(0x00) then win:fillRect(x, y + 1, w, ROW - 2, bg, { radius = 8 }) end
+    media.art(win, item.thumbnails, x + 8, y + 7, 40, 40, { radius = 5, kind = item.kind })
+    if options.playing then
+        -- Three bars bouncing while it plays.
+        win:fillRect(x + 8, y + 7, 40, 40, 0x00000088, { radius = 5 })
+        local t = os.clock()
+        for i = 0, 2 do
+            local hgt = player.playing and (6 + 9 * (0.5 + 0.5 * math.sin(t * 7 + i * 1.7))) or 5
+            win:fillRect(x + 18 + i * 7, y + 34 - hgt, 4, hgt, C.text, { radius = 1.5 })
+        end
+        if player.playing then anim.busy = true end
+    end
+    local right = options.removable and 64 or 50
+    local tw = w - 60 - right
+    win:text(x + 58, y + 9, item.title, { size = 13.5, font = fonts.medium, color = C.text, maxWidth = tw, overflow = "ellipsis" })
+    win:text(x + 58, y + 29, media.byline(item), { size = 12, font = fonts.regular, color = C.textDim, maxWidth = tw, overflow = "ellipsis" })
+    local removed = false
+    if options.removable and (st.hover or hv > 0.3) then
+        local rm = widgets.iconButton(win, `{id}:remove`, "close", x + w - 36, y + (ROW - 28) / 2, 28, { iconSize = 13 })
+        if rm.click then removed = true end
+    else
+        win:text(x + w - 10, y + (ROW - 17) / 2, item.durationText ?? media.clock(item.duration), { size = 12, font = fonts.regular,
+            color = C.textDim, align = "right" })
+    end
+    st.removed = removed
+    return st
+end
+
+-- Whether the pointer is over the (open) panel inside content area `R`: the
+-- shell keeps the wheel from scrolling the page under it.
+function panel.contains(R: table): boolean
+    if (anim.get("queue:open") ?? 0) < 0.5 then return false end
+    local w = math.min(panel.WIDTH, R.w - 40)
+    local x = R.x + R.w - w - 8
+    return input.inside and input.mx >= x and input.mx < R.x + R.w and input.my >= R.y + 44 and input.my < R.y + R.h
+end
+
+-- Draws the panel at the right of `R` (the content area). `ctx.play` plays
+-- autoplay suggestions.
+function panel.draw(win: any, R: table, ctx: table)
+    local p = anim.follow("queue:open", (panel.open and 1 or 0), 14, 0)
+    if p < 0.005 then return end
+    local w = math.min(panel.WIDTH, R.w - 40)
+    local x = R.x + R.w - w - 8 + (1 - p) * (w + 16)
+    local y = R.y + 44
+    local h = R.h - 52
+    win:pushOpacity(math.min(1, p * 1.4))
+    glass.panel(win, x, y, w, h, { radius = tokens.radius.panel, tint = C.popover, blur = 24 })
+
+    win:text(x + 18, y + 16, "Queue", { size = 18, font = fonts.display, color = C.text })
+    local bx = x + w - 14
+    local close = widgets.iconButton(win, "queue:close", "close", bx - 28, y + 12, 28, { iconSize = 13 })
+    if close.click then panel.open = false end
+    bx -= 34
+    local rep = widgets.iconButton(win, "queue:repeat", "repeat", bx - 28, y + 12, 28,
+        { iconSize = 15, active = player["repeat"] ~= "off", color = player["repeat"] ~= "off" and C.text or nil })
+    if player["repeat"] == "one" then win:text(bx - 7, y + 12, "1", { size = 9, font = fonts.bold, color = C.text }) end
+    if rep.click then queue.cycleRepeat() end
+    bx -= 32
+    local sh = widgets.iconButton(win, "queue:shuffle", "shuffle", bx - 28, y + 12, 28,
+        { iconSize = 15, active = player.shuffle, color = player.shuffle and C.text or nil })
+    if sh.click then queue.toggleShuffle() end
+
+    -- The list scrolls on its own; the wheel over the panel never reaches the page.
+    local listY = y + 52
+    local listH = h - 60
+    local over = input.inside and input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h
+    if over then
+        if input.scrollY ~= 0 then scrollTarget += input.scrollY end
+        input.scrollTaken = true
+        input.hit("queue:backdrop", x, y, w, h, { cursor = false })   -- clicks stop here
+    end
+
+    local current = queue.selected and queue.items[queue.selected]
+    local upcoming = queue.upcoming()
+    local auto = queue.automix
+    local contentH = 0
+    local blocks = {}
+    local function add(kind, data, height)
+        table.insert(blocks, { kind = kind, data = data, y = contentH, h = height })
+        contentH += height
+    end
+    add("label", { text = "Now playing" }, 30)
+    if current then add("current", current, ROW) else add("empty", "Nothing is playing", 40) end
+    if #upcoming > 0 then
+        add("label", { text = `Next up · {#upcoming}`, clear = true }, 40)
+        for _, item in upcoming do add("next", item, ROW) end
+    end
+    if #auto > 0 then
+        add("label", { text = "Autoplay" }, 40)
+        for _, item in auto do add("auto", item, ROW) end
+    end
+    contentH += 16
+    scrollTarget = math.clamp(scrollTarget, 0, math.max(0, contentH - listH))
+    local scroll = anim.follow("queue:scroll", scrollTarget, 16, scrollTarget)
+
+    win:pushClip(x, listY, w, listH)
+    local ix, iw = x + 8, w - 16
+    local dropAt = nil
+    local nextTop, nextBottom = nil, nil
+    for _, b in blocks do
+        if b.kind == "next" then
+            nextTop = nextTop ?? b.y
+            nextBottom = b.y + b.h
+        end
+    end
+    -- While dragging, the entry follows the pointer and the others make room.
+    if drag and drag.active and nextTop then
+        local rel = input.my - listY + scroll - drag.offsetY + ROW / 2
+        local slot = math.clamp(math.floor((rel - nextTop) / ROW), 0, #upcoming - 1)
+        dropAt = upcoming[slot + 1] and upcoming[slot + 1].index
+    end
+    local dragFrom = drag and drag.active and drag.index or nil
+    local slotOf = {}
+    for i, item in upcoming do slotOf[item.index] = i end
+    for _, b in blocks do
+        local by = listY + b.y - scroll
+        if by + b.h >= listY and by <= listY + listH then
+            if b.kind == "label" then
+                win:text(ix + 6, by + b.h - 22, b.data.text, { size = 12, font = fonts.semibold, color = C.textFaint, letterSpacing = 0.4 })
+                if b.data.clear then
+                    local cw = ui.measureText("Clear", { size = 12, font = fonts.semibold }) + 20
+                    local cst = widgets.pill(win, "queue:clear", "Clear", ix + iw - cw, by + b.h - 27, { height = 24, size = 12, padX = 10 })
+                    if cst.click then queue.clearUpcoming() end
+                end
+            elseif b.kind == "empty" then
+                win:text(ix + 6, by + 10, b.data, { size = 13, font = fonts.regular, color = C.textDim })
+            elseif b.kind == "current" then
+                local st = row(win, "queue:current", b.data, ix, by, iw, { playing = true })
+                if st.click then panel.open = false end
+            elseif b.kind == "next" then
+                local item = b.data
+                local shift = 0
+                if dragFrom and dropAt and item.index ~= dragFrom then
+                    local s, from, to = slotOf[item.index], slotOf[dragFrom], slotOf[dropAt]
+                    if from < to and s > from and s <= to then shift = -ROW end
+                    if from > to and s < from and s >= to then shift = ROW end
+                end
+                local oy = anim.follow(`queue:shift:{item.index}`, shift, 18, 0)
+                if item.index ~= dragFrom then
+                    local st = row(win, `queue:item:{item.index}`, item, ix, by + oy, iw, { removable = true })
+                    if st.removed then
+                        queue.remove(item.index)
+                    elseif st.press then
+                        drag = { index = item.index, startY = input.my, offsetY = input.my - (by + oy), active = false }
+                    elseif st.click and not (drag and drag.active) then
+                        queue.playAt(item.index)
+                    end
+                end
+            elseif b.kind == "auto" then
+                local st = row(win, `queue:auto:{b.data.videoId}`, b.data, ix, by, iw, {})
+                if st.click then ctx.play(b.data) end
+            end
+        end
+    end
+    -- The lifted entry, drawn last so it floats above the others.
+    if dragFrom then
+        local item = nil
+        for _, it in upcoming do if it.index == dragFrom then item = it end end
+        if item then
+            local ly = math.clamp(input.my - drag.offsetY, listY, listY + listH - ROW)
+            row(win, "queue:lifted", item, ix, ly, iw, { lifted = true })
+        end
+    end
+    win:popClip()
+    win:popOpacity()
+
+    if drag then
+        if not drag.active and input.down and math.abs(input.my - drag.startY) > 5 then drag.active = true end
+        if drag.active then input.cursor = "grabbing" end
+        if not input.down then
+            if drag.active and dropAt then queue.move(drag.index, dropAt) end
+            drag = nil
+        end
+    end
+end
+
+return panel

@@ -23,9 +23,30 @@ bridge.consent = false     -- the page is stuck on YouTube's cookie consent wall
 bridge.onReady = nil       -- function(identity)
 bridge.onState = nil       -- function(state)
 bridge.onConsent = nil     -- function()
+bridge.onQueue = nil       -- function(queue): the page's play queue changed
 
 local nextId = 0
 local pending = {}
+
+-- SHIRABE_TEST_NOPLAY=1 (scripted runs that must not touch the account):
+-- anything that plays, navigates the page or writes to YouTube Music is
+-- refused and printed instead.
+local NOPLAY = os.getenv("SHIRABE_TEST_NOPLAY") ~= nil
+local GUARDED_OPS = { play = true, resume = true, next = true, prev = true, queuePlay = true, queueAdd = true,
+    command = true, navigate = true }
+local function guardedEndpoint(endpoint: string): boolean
+    for _, prefix in { "like/", "playlist/", "browse/edit_playlist", "subscription/", "feedback" } do
+        if string.sub(endpoint, 1, #prefix) == prefix then return true end
+    end
+    return false
+end
+
+local function refused(op: string, args: table?): boolean
+    if not NOPLAY then return false end
+    local blocked = GUARDED_OPS[op] or (op == "api" and args ~= nil and guardedEndpoint(args.endpoint ?? ""))
+    if blocked then print(`[noplay] refused {op} {json.encode(args ?? {})}`) end
+    return blocked
+end
 
 -- Opens the page. options: visible, profile (data dir), mute (silence media:
 -- for automated runs)
@@ -99,11 +120,14 @@ function bridge.handle(event: table)
     elseif msg.type == "state" then
         bridge.state = msg
         if bridge.onState then bridge.onState(msg) end
+    elseif msg.type == "queue" then
+        if bridge.onQueue then bridge.onQueue(msg) end
     end
 end
 
 -- Sends an op without waiting for the answer.
 function bridge.send(op: string, args: table?)
+    if refused(op, args) then return end
     nextId += 1
     bridge.view:send({ id = nextId, op = op, args = args ?? {} })
 end
@@ -111,6 +135,7 @@ end
 -- Sends an op and waits for its answer. Call from a task: the wait yields.
 function bridge.call(op: string, args: table?, timeout: number?): any
     if not bridge.isOpen() then error("YouTube Music page is not open") end
+    if refused(op, args) then return nil end
     nextId += 1
     local id = nextId
     local slot = { done = false }

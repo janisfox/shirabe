@@ -50,7 +50,7 @@ function media.art(win: any, thumbnails: {table}?, x: number, y: number, w: numb
     local radius = o.round and math.min(w, h) / 2 or (o.radius ?? 6)
     local image, fade = images.get(thumbnails, math.max(w, h) * win:scale())
     if not image or fade < 1 then
-        win:fillRect(x, y, w, h, 0xFFFFFF12, { radius = radius })
+        win:fillRect(x, y, w, h, tokens.wash(0x12), { radius = radius })
         if not image then
             local s = math.min(w, h) * 0.32
             icons.draw(win, PLACEHOLDER_ICONS[o.kind ?? ""] ?? "lyrics", x + (w - s) / 2, y + (h - s) / 2, s, C.textFaint)
@@ -100,6 +100,7 @@ function media.card(win: any, id: string, item: table, x: number, y: number, w: 
     win:text(x, y + artH + 28, media.byline(item), { size = 12, font = fonts.regular, color = C.textDim,
         maxWidth = w, overflow = "ellipsis", align = align })
     if st.click and not played then ctx.open(item) end
+    if st.hover and input.rightPressed and ctx.menu then ctx.menu(item) end
     return h
 end
 
@@ -121,7 +122,7 @@ function media.row(win: any, id: string, item: table, x: number, y: number, w: n
     local st = input.hit(id, x - 8, y, w + 16, h)
     local hv = anim.follow(`{id}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
     if hv > 0.01 or o.playing then
-        win:fillRect(x - 8, y, w + 16, h, ui.mixColor(0xFFFFFF00, C.hover, math.max(hv, o.playing and 0.6 or 0)), { radius = 8 })
+        win:fillRect(x - 8, y, w + 16, h, ui.mixColor(tokens.wash(0x00), C.hover, math.max(hv, o.playing and 0.6 or 0)), { radius = 8 })
     end
     local cx = x
     if o.index then
@@ -155,6 +156,7 @@ function media.row(win: any, id: string, item: table, x: number, y: number, w: n
     if st.click then
         if media.isTrack(item) then ctx.play(item, o.context) else ctx.open(item) end
     end
+    if st.hover and input.rightPressed and ctx.menu then ctx.menu(item, o.context) end
     return h
 end
 

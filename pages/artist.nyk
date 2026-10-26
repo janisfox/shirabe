@@ -39,7 +39,7 @@ function artist.draw(win: any, R: table, ctx: table, params: table): number
             { 0, "#00000000" }, { 0.45, "#00000033" }, { 1, "#000000c0" } } } })
         win:popClip()
     else
-        win:fillRect(x, top, w, bannerH, 0xFFFFFF0D, { radius = 14 })
+        win:fillRect(x, top, w, bannerH, tokens.wash(0x0D), { radius = 14 })
     end
     local nx, ny = x + 24, top + bannerH - 120
     win:text(nx, ny, a.name, { size = 44, font = fonts.displayHeavy ?? fonts.display, color = C.text, maxWidth = w - 48, overflow = "ellipsis" })

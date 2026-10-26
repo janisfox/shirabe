@@ -1,0 +1,56 @@
+-- LRC parsing (services/lyrics/lrc).
+
+local check = require("tests/check")
+local lrc = require("services/lyrics/lrc")
+
+check.case("lrc parses times, sorts lines and skips metadata", function()
+    local parsed = lrc.parse("[ar:Someone]\n[00:12.50]second\r\n[00:01.00]first\n[01:02]third\nno tag\n")
+    check.eq(#parsed.lines, 3)
+    check.eq(parsed.lines[1].text, "first")
+    check.eq(parsed.lines[1].t, 1)
+    check.eq(parsed.lines[2].t, 12.5)
+    check.eq(parsed.lines[3].t, 62)
+end)
+
+check.case("lrc repeats a line for each of its time tags", function()
+    local parsed = lrc.parse("[00:10.00][00:30.00]chorus\n[00:20.00]verse")
+    check.eq(#parsed.lines, 3)
+    check.eq(parsed.lines[1].text, "chorus")
+    check.eq(parsed.lines[3].text, "chorus")
+    check.eq(parsed.lines[3].t, 30)
+end)
+
+check.case("lrc applies [offset] (positive = earlier)", function()
+    local parsed = lrc.parse("[offset:+500]\n[00:10.00]a")
+    check.eq(parsed.lines[1].t, 9.5)
+end)
+
+check.case("lrc reads enhanced word tags", function()
+    local parsed = lrc.parse("[00:05.00]<00:05.00>Hel<00:05.40>lo <00:06.00>world")
+    local line = parsed.lines[1]
+    check.eq(line.text, "Hello world")
+    check.eq(#line.words, 3)
+    check.eq(line.words[2].t, 5.4)
+    check.eq(line.words[3].text, "world")
+end)
+
+check.case("lrc keeps empty timed lines (instrumental breaks)", function()
+    local parsed = lrc.parse("[00:01.00]a\n[00:05.00]\n[00:09.00]b")
+    check.eq(#parsed.lines, 3)
+    check.eq(parsed.lines[2].text, "")
+end)
+
+check.case("lrc.active finds the line that has started", function()
+    local lines = lrc.parse("[00:01.00]a\n[00:05.00]b\n[00:09.00]c").lines
+    check.eq(lrc.active(lines, 0.5), 0)
+    check.eq(lrc.active(lines, 1), 1)
+    check.eq(lrc.active(lines, 8.9), 2)
+    check.eq(lrc.active(lines, 100), 3)
+end)
+
+check.case("plain lyrics drop surrounding blank lines", function()
+    local plain = lrc.plain("\n\nline one\n\nline two\n\n")
+    check.eq(#plain.lines, 3)
+    check.eq(plain.lines[1].text, "line one")
+    check.eq(plain.lines[2].text, "")
+end)

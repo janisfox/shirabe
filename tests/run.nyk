@@ -2,7 +2,7 @@
 
 local check = require("tests/check")
 
-for _, name in { "tests/test_common", "tests/test_pages" } do
+for _, name in { "tests/test_common", "tests/test_pages", "tests/test_lrc" } do
     print(name)
     require(name)
 end

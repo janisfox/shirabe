@@ -1,0 +1,19 @@
+# Now playing, lyrics, queue and popovers for whatever track the page has
+# loaded, without playing anything. Run with SHIRABE_TEST_NOPLAY=1.
+wait 9
+click 100 761
+wait 5
+snap p1-nowplaying
+key q ctrl
+wait 2
+snap p2-queue
+key q ctrl
+wait 0.6
+click 1177 761
+wait 1
+snap p3-fx
+key escape
+key escape
+wait 1
+snap p4-home
+quit

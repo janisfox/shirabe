@@ -42,7 +42,7 @@ function rail.draw(win: any, R: table, current: string, navigate: (string) -> an
     if activeIndex then
         local targetY = top + (activeIndex - 1) * (BUTTON + 6)
         local y = anim.follow("rail:pill", targetY, tokens.motion.pillRate)
-        win:fillRect(bx, y, BUTTON, BUTTON, 0xFFFFFF1C, { radius = tokens.radius.button })
+        win:fillRect(bx, y, BUTTON, BUTTON, tokens.wash(0x1C), { radius = tokens.radius.button })
     end
 
     for i, item in rail.items do
@@ -62,7 +62,7 @@ function rail.draw(win: any, R: table, current: string, navigate: (string) -> an
     local st = input.hit("rail:account", bx, avatarY, BUTTON, BUTTON)
     local hv = anim.follow("rail:account:hover", (st.hover and 1 or 0), tokens.motion.hoverRate)
     local cx, cy = bx + BUTTON / 2, avatarY + BUTTON / 2
-    win:circle(cx, cy, 15 + hv, ui.mixColor(0x2A2A30FF, 0x3A3A44FF, hv))
+    win:circle(cx, cy, 15 + hv, ui.mixColor(tokens.wash(0x18), tokens.wash(0x28), hv))
     local initial = (account and account.initial) ?? "?"
     win:text(cx, cy - 9, initial, { size = 14, font = fonts.semibold, color = C.text, align = "center" })
     if account and account.photo and #account.photo > 0 then

@@ -1,0 +1,535 @@
+-- The settings window: a modal with a searchable list of sections (Playback,
+-- Audio FX, Appearance, Background, YouTube Music, Storage, About). Every
+-- change applies at once and is saved; sliders save when the drag ends.
+--
+-- Rows are tables { section, label, desc?, keywords?, when?, h?, draw(win, x, y, w) }:
+-- `draw` draws the row's control in the right-hand column (or the whole row
+-- when `full` is set) and returns the row height when it differs from the
+-- default.
+
+local ui = require("@neyuki/ui")
+local fs = require("@neyuki/fs")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+local appearance = require("theme/appearance")
+local background = require("theme/background")
+local settings = require("state/settings")
+local session = require("state/session")
+local fx = require("state/fx")
+local lyrics = require("state/lyrics")
+local player = require("state/player")
+local playback = require("state/playback")
+local bridge = require("services/ytm/bridge")
+
+local C = tokens.color
+local view = {}
+
+view.open = false
+
+local SECTIONS = {
+    { id = "playback", label = "Playback", icon = "play" },
+    { id = "fx", label = "Audio FX", icon = "sliders" },
+    { id = "appearance", label = "Appearance", icon = "grid" },
+    { id = "background", label = "Background", icon = "library" },
+    { id = "youtube", label = "YouTube Music", icon = "user" },
+    { id = "storage", label = "Storage", icon = "list" },
+    { id = "about", label = "About", icon = "lyrics" },
+}
+
+local selected = "playback"
+local scrollTarget = 0
+local confirmSignOut = 0      -- os.clock() until which "Sign out" asks for a second click
+local ROW_H = 58
+local CONTROL_W = 280
+
+local function save() settings.save() end
+
+-- ROW BUILDERS -------------------------------------------------------------------
+
+local rows = {}
+
+local function add(row: table)
+    table.insert(rows, row)
+end
+
+-- A slider with its value shown at its right. get() / set(v, commit).
+local function slider(section: string, label: string, desc: string?, options: table)
+    add({ section = section, label = label, desc = desc, keywords = options.keywords, when = options.when,
+        draw = function(win, x, y, w)
+            local v = options.get()
+            local text = options.format and options.format(v) or tostring(v)
+            win:text(x + w, y + 8, text, { size = 12.5, font = fonts.medium, color = C.textDim, align = "right" })
+            local nv, st = widgets.slider(win, `set:{section}:{label}`, x, y + 32, w, v, options.min, options.max,
+                { step = options.step, default = options.default })
+            if st.changed then options.set(nv, false) end
+            if st.committed then options.set(options.get(), true) end
+        end })
+end
+
+local function toggle(section: string, label: string, desc: string?, get: () -> boolean, set: (boolean) -> any, options: table?)
+    local o = options ?? {}
+    add({ section = section, label = label, desc = desc, keywords = o.keywords, when = o.when,
+        draw = function(win, x, y, w)
+            if widgets.toggle(win, `set:{section}:{label}`, x + w - 40, y + 17, get()).click then set(not get()) end
+        end })
+end
+
+-- labels; get() -> index; set(index)
+local function choice(section: string, label: string, desc: string?, labels: {string}, get: () -> number?,
+    set: (number) -> any, options: table?)
+    local o = options ?? {}
+    add({ section = section, label = label, desc = desc, keywords = o.keywords, when = o.when, wide = o.wide,
+        draw = function(win, x, y, w)
+            local sw = widgets.segmentedWidth(labels, { size = 12 })
+            local picked = widgets.segmented(win, `set:{section}:{label}`, x + w - sw, y + 12, labels, get(), { size = 12 })
+            if picked then set(picked) end
+        end })
+end
+
+-- A row of color swatches plus a hex field. get() -> "#rrggbb"; set(hex).
+local SWATCHES = { "#f2f2f0", "#ff5c5c", "#ff9f43", "#ffd43b", "#51cf66", "#22b8cf", "#4c6ef5", "#be4bdb", "#f783ac" }
+
+local function colorRow(section: string, label: string, desc: string?, get: () -> string, set: (string) -> any, options: table?)
+    local o = options ?? {}
+    add({ section = section, label = label, desc = desc, keywords = o.keywords, when = o.when, h = 92,
+        draw = function(win, x, y, w)
+            local id = `set:{section}:{label}`
+            local current = string.lower(get() ?? "")
+            local sx = x + w - #SWATCHES * 28 + 4
+            for i, hex in SWATCHES do
+                local cx, cy = sx + (i - 1) * 28 + 10, y + 22
+                local st = input.hit(`{id}:{i}`, cx - 12, cy - 12, 24, 24)
+                if current == hex then win:circle(cx, cy, 12, C.text) end
+                win:circle(cx, cy, (st.hover and 10 or 9), appearance.parseHex(hex))
+                if st.click then
+                    set(hex)
+                    widgets.setFieldText(`{id}:hex`, hex)
+                end
+            end
+            if widgets.focusedField() ~= `{id}:hex` then widgets.setFieldText(`{id}:hex`, current) end
+            local field = widgets.textField(win, `{id}:hex`, x + w - 140, y + 46, 140, 32, { placeholder = "#rrggbb", win = win })
+            local typed = appearance.parseHex(widgets.fieldText(`{id}:hex`))
+            if typed and (field.changed or field.submitted) then set(appearance.hex(typed)) end
+            if typed then win:fillRect(x + w - 176, y + 50, 24, 24, typed, { radius = 6 }) end
+        end })
+end
+
+local function action(section: string, label: string, desc: string?, button: string, act: () -> any, options: table?)
+    local o = options ?? {}
+    add({ section = section, label = label, desc = desc, keywords = o.keywords, when = o.when,
+        draw = function(win, x, y, w)
+            local text = (type(button) == "function") and button() or button
+            local bw = ui.measureText(text, { size = 13, font = fonts.semibold }) + 28
+            local st = widgets.pill(win, `set:{section}:{label}`, text, x + w - bw, y + 12, { size = 13, height = 32,
+                primary = o.primary })
+            if st.click then act() end
+        end })
+end
+
+local function info(section: string, label: string, desc: string?, value: () -> string, options: table?)
+    local o = options ?? {}
+    add({ section = section, label = label, desc = desc, keywords = o.keywords, when = o.when,
+        draw = function(win, x, y, w)
+            win:text(x, y + 19, value(), { size = 13, font = fonts.medium, color = C.textDim, align = "right",
+                maxWidth = w, overflow = "ellipsis" })
+        end })
+end
+
+-- PLAYBACK ---------------------------------------------------------------------------
+
+local function cfg(): table return settings.values end
+
+slider("playback", "Volume", "The YouTube Music player's own volume.", {
+    get = function() return player.volume end,
+    set = function(v, commit)
+        playback.setVolume(v)
+        if commit then
+            cfg().playback.volume = player.volume
+            save()
+        end
+    end,
+    min = 0, max = 1, step = 0.01, default = 1,
+    format = function(v) return string.format("%d%%", math.round(v * 100)) end,
+})
+
+local SHORTCUTS = {
+    { "Space", "Play / pause" }, { "← / →", "Seek 5 seconds" }, { "Ctrl ← / →", "Previous / next track" },
+    { "Ctrl L", "Like the playing track" }, { "Ctrl K", "Search" }, { "Ctrl Q", "Queue" },
+    { "F11", "Now playing" }, { "Ctrl ,", "Settings" }, { "Ctrl 1 / 2 / 3", "Home / Search / Library" },
+    { "Alt ← / Backspace", "Back" }, { "Esc", "Close what is on top" },
+}
+for _, s in SHORTCUTS do
+    info("playback", s[2], nil, function() return s[1] end, { keywords = "shortcut keyboard key hotkey" })
+end
+
+-- AUDIO FX ------------------------------------------------------------------------------
+
+local function fxSlider(label: string, desc: string?, key: string, min: number, max: number, step: number,
+    default: number, format: (number) -> string, when: (() -> boolean)?)
+    slider("fx", label, desc, {
+        get = function() return fx.values()[key] end,
+        set = function(v, commit)
+            fx.values()[key] = v
+            fx.changed(commit)
+        end,
+        min = min, max = max, step = step, default = default, format = format, when = when, keywords = "audio effect",
+    })
+end
+
+local function names(list: {table}): {string}
+    local out = {}
+    for i, p in list do out[i] = p.name end
+    return out
+end
+
+choice("fx", "Sound", "Whole-sound presets.", { "Normal", "Nightcore", "Slowed", "Daycore" },
+    function() return fx.matching(fx.MOODS) end, function(i) fx.set(fx.MOODS[i]) end, { keywords = "preset nightcore slowed" })
+fxSlider("Speed", "Playback speed. YouTube Music still counts the listen.", "speed", 0.5, 2, 0.01, 1,
+    function(v) return string.format("%.2f×", v) end)
+fxSlider("Pitch", "In semitones, independent of speed.", "pitch", -12, 12, 0.5, 0,
+    function(v) return string.format("%+.1f st", v) end, function() return not fx.values().link end)
+toggle("fx", "Link pitch to speed", "Like a record played faster or slower (nightcore, slowed).",
+    function() return fx.values().link end, function(v) fx.set({ link = v }) end)
+choice("fx", "Reverb", nil, names(fx.REVERBS), function() return fx.matching(fx.REVERBS) end,
+    function(i) fx.set(fx.REVERBS[i]) end)
+fxSlider("Reverb mix", "How much of the reverberated sound is heard.", "reverb", 0, 1, 0.01, 0,
+    function(v) return string.format("%d%%", math.round(v * 100)) end)
+fxSlider("Reverb decay", "How long the room rings.", "decay", 0.3, 8, 0.1, 2.4,
+    function(v) return string.format("%.1f s", v) end, function() return fx.values().reverb > 0 end)
+fxSlider("Pre-delay", "Silence before the reverb starts.", "preDelay", 0, 0.2, 0.005, 0.02,
+    function(v) return string.format("%d ms", math.round(v * 1000)) end, function() return fx.values().reverb > 0 end)
+choice("fx", "Equalizer", nil, names(fx.EQS), function() return fx.matching(fx.EQS) end,
+    function(i) fx.set({ eq = table.clone(fx.EQS[i].eq) }) end, { keywords = "eq bass treble" })
+for band = 1, #fx.BANDS do
+    slider("fx", `{fx.BANDS[band]}Hz`, nil, {
+        get = function() return fx.values().eq[band] end,
+        set = function(v, commit)
+            fx.values().eq[band] = v
+            fx.changed(commit)
+        end,
+        min = -12, max = 12, step = 0.5, default = 0, keywords = "eq equalizer band",
+        format = function(v) return string.format("%+.1f dB", v) end,
+    })
+end
+fxSlider("Pre-amp", "Raises or lowers everything after the EQ.", "preamp", -12, 12, 0.5, 0,
+    function(v) return string.format("%+.1f dB", v) end)
+toggle("fx", "Normalize loudness", "A gentle compressor evens out loud and quiet tracks.",
+    function() return fx.values().loudness end, function(v) fx.set({ loudness = v }) end, { keywords = "compressor volume" })
+action("fx", "Reset Audio FX", "Back to the untouched sound.", "Reset", function() fx.reset() end)
+
+-- APPEARANCE ----------------------------------------------------------------------------
+
+local function look(): table return settings.values.appearance end
+
+choice("appearance", "Text tone", "Light text for dark backgrounds, dark text for light ones.", { "Light text", "Dark text" },
+    function() return (look().tone == "light") and 2 or 1 end,
+    function(i)
+        look().tone = (i == 2) and "light" or "dark"
+        save()
+    end, { keywords = "theme dark light mode" })
+choice("appearance", "Accent", "Progress bar, sliders and switches.", { "From cover art", "Custom" },
+    function() return (look().accent == "cover") and 1 or 2 end,
+    function(i)
+        look().accent = (i == 1) and "cover" or (appearance.hex(C.accent))
+        save()
+    end, { keywords = "color colour" })
+colorRow("appearance", "Accent color", nil, function() return look().accent end, function(hex)
+    look().accent = hex
+    save()
+end, { when = function() return look().accent ~= "cover" end, keywords = "color colour" })
+slider("appearance", "Glass opacity", "How solid the rail, player bar and panels are.", {
+    get = function() return look().glass end,
+    set = function(v, commit)
+        look().glass = v
+        if commit then save() end
+    end,
+    min = 0.4, max = 1, step = 0.01, default = 0.88, keywords = "transparency panel",
+    format = function(v) return string.format("%d%%", math.round(v * 100)) end,
+})
+slider("appearance", "Corner radius", "Roundness of panels and cards.", {
+    get = function() return look().radius end,
+    set = function(v, commit)
+        look().radius = v
+        if commit then save() end
+    end,
+    min = 0, max = 24, step = 1, default = 14, keywords = "rounded corners",
+    format = function(v) return `{math.round(v)} px` end,
+})
+
+-- BACKGROUND ------------------------------------------------------------------------------
+
+local function bg(): table return settings.values.background end
+local KINDS = { "default", "color", "gradient", "image", "cover" }
+
+local function reloadBackground()
+    save()
+    background.reload(bg())
+end
+
+choice("background", "Source", nil, { "Default", "Color", "Gradient", "Image", "Cover art" },
+    function()
+        for i, k in KINDS do
+            if bg().kind == k then return i end
+        end
+        return 1
+    end,
+    function(i)
+        bg().kind = KINDS[i]
+        reloadBackground()
+    end, { keywords = "wallpaper" })
+colorRow("background", "Color", nil, function() return bg().color end, function(hex)
+    bg().color = hex
+    reloadBackground()
+end, { when = function() return bg().kind == "color" end })
+colorRow("background", "Gradient start", nil, function() return bg().gradient.from end, function(hex)
+    bg().gradient.from = hex
+    reloadBackground()
+end, { when = function() return bg().kind == "gradient" end })
+colorRow("background", "Gradient end", nil, function() return bg().gradient.to end, function(hex)
+    bg().gradient.to = hex
+    reloadBackground()
+end, { when = function() return bg().kind == "gradient" end })
+slider("background", "Gradient angle", nil, {
+    get = function() return bg().gradient.angle end,
+    set = function(v, commit)
+        bg().gradient.angle = v
+        if commit then save() end
+    end,
+    min = 0, max = 360, step = 5, default = 135, when = function() return bg().kind == "gradient" end,
+    format = function(v) return `{math.round(v)}°` end,
+})
+info("background", "Image", "Drop an image, GIF or animated WebP onto the window to use it.", function()
+    local path = bg().path
+    if not path then return "none yet" end
+    return background.error() or fs.basename(path)
+end, { when = function() return bg().kind == "image" end, keywords = "gif webp picture photo file" })
+toggle("background", "Animate", "Play animated backgrounds (off saves battery).",
+    function() return bg().animate ~= false end,
+    function(v)
+        bg().animate = v
+        save()
+    end, { when = function() return bg().kind == "image" end, keywords = "gif" })
+slider("background", "Blur", nil, {
+    get = function() return bg().blur end,
+    set = function(v, commit)
+        bg().blur = v
+        if commit then reloadBackground() end
+    end,
+    min = 0, max = 80, step = 1, default = 28, when = function() return bg().kind == "image" or bg().kind == "cover" end,
+    format = function(v) return `{math.round(v)}` end,
+})
+slider("background", "Dim", "Darkens the background under the content.", {
+    get = function() return bg().dim end,
+    set = function(v, commit)
+        bg().dim = v
+        if commit then save() end
+    end,
+    min = 0, max = 0.9, step = 0.01, default = 0.35, when = function() return bg().kind == "image" or bg().kind == "cover" end,
+    format = function(v) return string.format("%d%%", math.round(v * 100)) end,
+})
+
+-- YOUTUBE MUSIC ---------------------------------------------------------------------------
+
+add({ section = "youtube", label = "Accounts", desc = "Your Google account and its brand accounts. Plays count on the selected one.",
+    keywords = "brand account switch google", full = true,
+    draw = function(win, x, y, w)
+        local list = session.accounts ?? {}
+        local ry = y + 48
+        if #list == 0 then
+            win:text(x, ry, (session.status == "signedOut") and "Not signed in." or "Loading accounts…",
+                { size = 13, font = fonts.regular, color = C.textDim })
+            return 80
+        end
+        for i, a in list do
+            local st = input.hit(`set:account:{i}`, x - 8, ry, w + 16, 52)
+            if st.hover then win:fillRect(x - 8, ry, w + 16, 52, C.hover, { radius = 8 }) end
+            win:circle(x + 20, ry + 26, 18, tokens.wash(0x18))
+            win:text(x + 20, ry + 16, string.upper(string.sub(a.name, 1, 1)), { size = 14, font = fonts.semibold,
+                color = C.text, align = "center" })
+            media.art(win, a.photo, x + 2, ry + 8, 36, 36, { round = true })
+            win:text(x + 52, ry + 8, a.name, { size = 14, font = fonts.semibold, color = C.text, maxWidth = w - 200, overflow = "ellipsis" })
+            win:text(x + 52, ry + 28, a.handle ?? a.byline ?? "", { size = 12, font = fonts.regular, color = C.textDim,
+                maxWidth = w - 200, overflow = "ellipsis" })
+            if a.selected then
+                win:text(x + w, ry + 18, "Selected", { size = 12.5, font = fonts.semibold, color = C.accent, align = "right" })
+            else
+                local bw = ui.measureText("Switch", { size = 12.5, font = fonts.semibold }) + 24
+                local sw = widgets.pill(win, `set:account:{i}:switch`, "Switch", x + w - bw, ry + 11, { size = 12.5, height = 30, padX = 12 })
+                if sw.click then session.switchTo(a) end
+            end
+            ry += 54
+        end
+        return ry - y + 6
+    end })
+action("youtube", "Sign in", "Opens Google's sign-in page in its own window. Shirabe never sees your password.",
+    "Sign in with Google", function() session.signIn() end,
+    { when = function() return session.status == "signedOut" end, primary = true, keywords = "login google" })
+action("youtube", "Sign out", "Forgets the YouTube Music session on this computer.",
+    function() return (os.clock() < confirmSignOut) and "Click again to sign out" or "Sign out" end,
+    function()
+        if os.clock() < confirmSignOut then
+            confirmSignOut = 0
+            session.signOut()
+        else
+            confirmSignOut = os.clock() + 4
+        end
+    end, { when = function() return session.status == "ready" or session.status == "switching" end, keywords = "logout" })
+toggle("youtube", "Show the YouTube Music window", "The hidden page Shirabe plays through (for troubleshooting).",
+    function() return view.pageShown == true end,
+    function(v)
+        view.pageShown = v
+        if v then bridge.show() else bridge.hide() end
+    end, { keywords = "debug webview browser page" })
+
+-- STORAGE ---------------------------------------------------------------------------------------
+
+local function count(dir: string): number
+    if not fs.isDir(dir) then return 0 end
+    return #fs.list(dir)
+end
+
+action("storage", "Lyrics cache", nil, function()
+    return `Clear ({count(fs.join(os.cacheDir("shirabe"), "lyrics"))} tracks)`
+end, function() lyrics.clearCache() end, { keywords = "cache lyrics delete" })
+info("storage", "Settings file", nil, function() return fs.join(os.configDir("shirabe"), "settings.json") end,
+    { keywords = "config folder path" })
+action("storage", "Data folder", "Backgrounds, the YouTube Music session and caches.", "Open", function()
+    ui.openUrl("file:///" .. (string.gsub(os.dataDir("shirabe"), "\\", "/")))
+end, { keywords = "folder files path" })
+
+-- ABOUT ---------------------------------------------------------------------------------------------
+
+info("about", "Version", nil, function()
+    local app = os.app()
+    return app.bundled and `shirabe {app.version}` or "shirabe (development build)"
+end)
+info("about", "Playback", "Everything plays through music.youtube.com, so history and Recap count as usual.",
+    function() return "" end)
+info("about", "Lyrics", nil, function() return "LRCLIB · YouTube Music" end)
+info("about", "Fonts", nil, function() return "Montserrat, Inter (SIL Open Font License)" end, { keywords = "licence license" })
+action("about", "Source code", nil, "GitHub", function() ui.openUrl("https://github.com/janisfox/shirabe") end)
+
+-- DRAWING ----------------------------------------------------------------------------------------------
+
+local function matches(row: table, query: string): boolean
+    local hay = string.lower(`{row.label} {row.desc ?? ""} {row.keywords ?? ""} {row.section}`)
+    return string.find(hay, query, 1, true) ~= nil
+end
+
+local function sectionLabel(id: string): string
+    for _, s in SECTIONS do
+        if s.id == id then return s.label end
+    end
+    return id
+end
+
+function view.show(section: string?)
+    view.open = true
+    if section then selected = section end
+end
+
+-- Draws the window over everything (call late in the frame).
+function view.draw(win: any)
+    local p = anim.follow("settings:open", (view.open and 1 or 0), 14, 0)
+    if p < 0.01 then return end
+    local W, H = win:size()
+    win:pushOpacity(p)
+    -- The dimmed backdrop takes every click; a click on it closes the window.
+    win:fillRect(0, 0, W, H, 0x00000080)
+    local back = input.hit("settings:backdrop", 0, 0, W, H, { cursor = false })
+    local w = math.min(920, W - 80)
+    local h = math.min(640, H - 70)
+    local x = math.floor((W - w) / 2)
+    local y = math.floor((H - h) / 2 + (1 - p) * 16)
+    -- No live blur: at this size it would cost tens of milliseconds a frame.
+    glass.panel(win, x, y, w, h, { radius = 16, tint = C.popover, blur = 0 })
+    input.hit("settings:panel", x, y, w, h, { cursor = false })
+    if back.click then view.open = false end
+
+    -- Left: search and sections.
+    local navW = 220
+    win:fillRect(x, y, navW, h, tokens.wash(0x08), { radius = 16 })
+    win:text(x + 20, y + 20, "Settings", { size = 20, font = fonts.display, color = C.text })
+    local field = widgets.textField(win, "settings:search", x + 14, y + 58, navW - 28, 34,
+        { placeholder = "Search settings", icon = "search", win = win })
+    local query = string.lower(widgets.fieldText("settings:search"))
+    local ny = y + 106
+    for _, s in SECTIONS do
+        local active = query == "" and s.id == selected
+        local st = input.hit(`settings:nav:{s.id}`, x + 10, ny, navW - 20, 36)
+        local hv = anim.follow(`settings:nav:{s.id}:h`, ((st.hover or active) and 1 or 0), tokens.motion.hoverRate)
+        if hv > 0.01 then win:fillRect(x + 10, ny, navW - 20, 36, active and tokens.wash(0x1C) or ui.mixColor(tokens.wash(0x00), C.hover, hv), { radius = 8 }) end
+        icons.draw(win, s.icon, x + 22, ny + 10, 16, active and C.text or C.textDim)
+        win:text(x + 48, ny + 9, s.label, { size = 13.5, font = active and fonts.semibold or fonts.medium,
+            color = active and C.text or C.textDim })
+        if st.click then
+            selected = s.id
+            scrollTarget = 0
+            widgets.setFieldText("settings:search", "")
+            widgets.focus(nil, win)
+        end
+        ny += 38
+    end
+    local close = widgets.iconButton(win, "settings:close", "close", x + w - 42, y + 14, 28, { iconSize = 14 })
+    if close.click then view.open = false end
+
+    -- Right: the rows of the section (or every match of the search).
+    local cx = x + navW + 28
+    local cw = w - navW - 56
+    local top = y + 20
+    local list = {}
+    for _, row in rows do
+        local visible = (query ~= "") and matches(row, query) or (query == "" and row.section == selected)
+        if visible and (not row.when or row.when()) then table.insert(list, row) end
+    end
+    local over = input.inside and input.mx >= cx - 10 and input.mx < x + w and input.my >= top and input.my < y + h
+    if over and input.scrollY ~= 0 then scrollTarget += input.scrollY end
+    input.scrollTaken = true
+    local scroll = anim.follow("settings:scroll", scrollTarget, 16, scrollTarget)
+    win:pushClip(cx - 12, top, cw + 24, h - 24)
+    local ry = top + 4 - scroll
+    local heading = (query ~= "") and `Results for "{widgets.fieldText("settings:search")}"` or sectionLabel(selected)
+    win:text(cx, ry + 2, heading, { size = 18, font = fonts.display, color = C.text, maxWidth = cw - 40, overflow = "ellipsis" })
+    ry += 44
+    if #list == 0 then
+        win:text(cx, ry, "Nothing matches.", { size = 13.5, font = fonts.regular, color = C.textDim })
+    end
+    local lastSection = nil
+    for _, row in list do
+        if query ~= "" and row.section ~= lastSection then
+            win:text(cx, ry + 6, string.upper(sectionLabel(row.section)), { size = 11, font = fonts.semibold,
+                color = C.textFaint, letterSpacing = 0.6 })
+            ry += 28
+            lastSection = row.section
+        end
+        local rh = row.h ?? ROW_H
+        local labelW = row.full and cw or (cw - CONTROL_W - 24)
+        win:text(cx, ry + 10, row.label, { size = 14, font = fonts.semibold, color = C.text, maxWidth = labelW, overflow = "ellipsis" })
+        if row.desc then
+            local _dw, dh = win:text(cx, ry + 30, row.desc, { size = 12, font = fonts.regular, color = C.textDim, maxWidth = labelW })
+            rh = math.max(rh, 30 + dh + 10)
+        end
+        local used = nil
+        if row.full then
+            used = row.draw(win, cx, ry, cw)
+        else
+            used = row.draw(win, cx + cw - CONTROL_W, ry, CONTROL_W)
+        end
+        if type(used) == "number" then rh = math.max(rh, used) end
+        win:line(cx, ry + rh - 0.5, cx + cw, ry + rh - 0.5, tokens.wash(0x0F), { width = 1 })
+        ry += rh
+    end
+    local contentH = ry + scroll - top + 20
+    scrollTarget = math.clamp(scrollTarget, 0, math.max(0, contentH - (h - 24)))
+    win:popClip()
+    win:popOpacity()
+    if field.submitted then widgets.focus(nil, win) end
+end
+
+return view

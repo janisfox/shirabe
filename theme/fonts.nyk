@@ -1,4 +1,4 @@
--- Font loading. Display text uses Builder Extended (assets/fonts); body text
+-- Font loading. Display text uses Montserrat Medium (assets/fonts, OFL); body text
 -- uses Inter when its files are in assets/fonts, else Segoe UI. CJK, Hangul
 -- and emoji come from the system's own fonts through the fallback list.
 
@@ -21,16 +21,16 @@ local function body(weight: number, interFile: string): any
 end
 
 function fonts.load()
-    fonts.display = file("BuilderExtended-Bold.otf")
-    fonts.displayHeavy = file("BuilderExtended-ExtraBold.otf") ?? fonts.display
-    fonts.displayLight = file("BuilderExtended-SemiBold.otf") ?? fonts.display
+    fonts.display = file("Montserrat-Medium.ttf") ?? ui.systemFont("Segoe UI", { weight = 600 })
+    fonts.displayHeavy = file("Montserrat-SemiBold.ttf") ?? fonts.display
+    fonts.displayLight = fonts.display
     fonts.regular = body(400, "Inter-Regular.ttf")
     fonts.medium = body(500, "Inter-Medium.ttf") ?? fonts.regular
     fonts.semibold = body(600, "Inter-SemiBold.ttf") ?? fonts.medium
     fonts.bold = body(700, "Inter-Bold.ttf") ?? fonts.semibold
 
     local fallbacks = {}
-    for _, family in { "Yu Gothic UI", "Malgun Gothic", "Microsoft YaHei UI", "Segoe UI Symbol", "Segoe UI Emoji" } do
+    for _, family in { "Yu Gothic UI", "Malgun Gothic", "Microsoft YaHei UI", "Nirmala UI", "Segoe UI Symbol", "Segoe UI Emoji" } do
         local font = ui.systemFont(family)
         if font then table.insert(fallbacks, font) end
     end

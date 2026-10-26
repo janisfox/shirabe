@@ -52,7 +52,7 @@ local function suggestionsBox(win: any, x: number, y: number, w: number, ctx: ta
     local entry = loader.get(`suggest:{text}`, function() return api.suggestions(text) end)
     if entry.status ~= "ready" or #entry.value == 0 then return end
     local h = #entry.value * 34 + 12
-    win:fillRect(x, y, w, h, 0x16161AF5, { radius = 10, shadow = { blur = 24, offsetY = 10, color = 0x00000080 } })
+    win:fillRect(x, y, w, h, C.popover, { radius = 10, shadow = { blur = 24, offsetY = 10, color = 0x00000080 } })
     for i, suggestion in entry.value do
         local sy = y + 6 + (i - 1) * 34
         local st = input.hit(`search:suggest:{i}`, x + 6, sy, w - 12, 34)
@@ -68,7 +68,7 @@ local function topResult(win: any, top: table, x: number, y: number, w: number, 
     local h = 128
     local st = input.hit("search:top", x, y, w, h)
     local hv = anim.follow("search:top:hover", (st.hover and 1 or 0), tokens.motion.hoverRate)
-    win:fillRect(x, y, w, h, ui.mixColor(0xFFFFFF0D, 0xFFFFFF18, hv), { radius = 12 })
+    win:fillRect(x, y, w, h, ui.mixColor(tokens.wash(0x0D), tokens.wash(0x18), hv), { radius = 12 })
     media.art(win, top.thumbnails, x + 16, y + 16, 96, 96, { round = top.kind == "artist", radius = 8, kind = top.kind })
     win:text(x + 128, y + 30, top.title, { size = 22, font = fonts.bold, color = C.text, maxWidth = w - 200, overflow = "ellipsis" })
     win:text(x + 128, y + 62, media.byline(top), { size = 13.5, font = fonts.regular, color = C.textDim, maxWidth = w - 200, overflow = "ellipsis" })
@@ -76,7 +76,7 @@ local function topResult(win: any, top: table, x: number, y: number, w: number, 
         local px, py = x + w - 64, y + h / 2 - 22
         local pst = input.hit("search:top:play", px, py, 44, 44)
         win:circle(px + 22, py + 22, 22 + (pst.hover and 1 or 0), C.text)
-        icons.draw(win, "play", px + 12, py + 12, 20, 0x111113FF)
+        icons.draw(win, "play", px + 12, py + 12, 20, C.textOnActive)
         if pst.click then
             ctx.play(top)
             return h

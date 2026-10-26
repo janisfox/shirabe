@@ -1,5 +1,6 @@
 -- The window background: a default gradient, a flat color, a custom gradient,
--- or an image / animated GIF / animated WebP chosen by the user. Images are
+-- an image / animated GIF / animated WebP chosen by the user, or the playing
+-- track's cover art. Images are
 -- resized to cover the window and blurred once per window size (every frame of
 -- an animation), so drawing them each frame is a plain cached blit.
 
@@ -13,13 +14,17 @@ local prepared = nil   -- cover-sized, blurred copy for the current window
 local preparedKey = nil
 local animation = nil
 local loadError = nil
+local owned = false    -- `source` was loaded here (a cover belongs to the image cache)
+local generation = 0   -- bumps whenever `source` changes (part of the canvas key)
 
 -- (Re)loads the image named by the settings. Errors are kept so the shell can
 -- show them, and the default background is used meanwhile.
 function background.reload(cfg: table)
-    if source then source:close() end
+    if source and owned then source:close() end
     if prepared and prepared ~= source then prepared:close() end
     source, prepared, preparedKey, animation, loadError = nil, nil, nil, nil, nil
+    owned = false
+    generation += 1
     if cfg.kind == "image" and cfg.path then
         if not fs.exists(cfg.path) then
             loadError = "background file is missing"
@@ -28,6 +33,7 @@ function background.reload(cfg: table)
         local ok, image = pcall(ui.loadImage, cfg.path, { maxBytes = 768 * 1024 * 1024 })
         if ok then
             source = image
+            owned = true
             if image.frames > 1 then animation = ui.animation(image, { loop = true }) end
         else
             loadError = tostring(image)
@@ -104,15 +110,21 @@ local cacheKey = nil
 -- Draws the background over the whole surface. Still backgrounds are painted
 -- once per size and settings into a canvas and blitted afterwards; animated
 -- ones are painted every frame. Returns true while frames keep changing.
-function background.draw(target: any, w: number, h: number, dt: number, cfg: table): boolean
+function background.draw(target: any, w: number, h: number, dt: number, cfg: table, cover: any?): boolean
     local scale = target:scale()
+    -- Cover art: the playing track's artwork, swapped in when it changes.
+    if cfg.kind == "cover" and cover ~= source then
+        if prepared and prepared ~= source then prepared:close() end
+        source, prepared, preparedKey, owned = cover, nil, nil, false
+        generation += 1
+    end
     if source then prepare(w, h, scale, cfg.blur ?? 0, dt) end
     if source and animation and cfg.animate ~= false then
         paint(target, w, h, cfg, animation:update(dt))
         return true
     end
     local g = cfg.gradient ?? {}
-    local key = `{w}x{h}@{scale}|{cfg.kind}|{cfg.color}|{g.from}|{g.to}|{g.angle}|{cfg.dim}|{preparedKey}`
+    local key = `{w}x{h}@{scale}|{cfg.kind}|{cfg.color}|{g.from}|{g.to}|{g.angle}|{cfg.dim}|{preparedKey}|{generation}`
     if key ~= cacheKey then
         if cache then cache:close() end
         cache = ui.canvas(w, h, { scale = scale })

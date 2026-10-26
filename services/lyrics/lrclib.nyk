@@ -1,0 +1,55 @@
+-- LRCLIB (https://lrclib.net), an open database of synced lyrics. Requests go
+-- from Neyuki's own http client, inside a task.
+
+local http = require("@neyuki/http")
+
+local lrclib = {}
+
+local BASE = "https://lrclib.net/api/"
+local HEADERS = { ["user-agent"] = "shirabe/0.1 (https://github.com/janisfox/shirabe)" }
+
+local function decode(response: any): any
+    if not response.ok then return nil end
+    local ok, value = pcall(json.decode, response.body)
+    if ok and type(value) == "table" then return value end
+    return nil
+end
+
+local function text(v: any): string?
+    if type(v) == "string" and v ~= "" then return v end
+    return nil
+end
+
+-- A record -> { synced = LRC text?, plain = text?, duration, id }.
+local function record(r: table): table
+    return { synced = text(r.syncedLyrics), plain = text(r.plainLyrics), duration = r.duration, id = r.id,
+        instrumental = r.instrumental == true }
+end
+
+-- The best match for a track (title, artist, album?, duration?), or nil.
+-- The exact lookup needs the duration within 2 s; the search fallback takes
+-- the closest duration, preferring synced lyrics.
+function lrclib.find(title: string, artist: string, album: string?, duration: number?): table?
+    if duration and duration > 0 then
+        local query = { track_name = title, artist_name = artist, duration = math.round(duration) }
+        if album then query.album_name = album end
+        local exact = decode(http.get(BASE .. "get?" .. http.query(query), { headers = HEADERS, timeout = 10 }))
+        if exact and (exact.syncedLyrics or exact.plainLyrics) then return record(exact) end
+    end
+    local list = decode(http.get(BASE .. "search?" .. http.query({ track_name = title, artist_name = artist }),
+        { headers = HEADERS, timeout = 10 }))
+    if not list then return nil end
+    local best, bestScore = nil, math.huge
+    for _, r in list do
+        if type(r) == "table" and (text(r.syncedLyrics) or text(r.plainLyrics)) then
+            local off = (duration and type(r.duration) == "number") and math.abs(r.duration - duration) or 5
+            if off <= 8 then
+                local score = off + (text(r.syncedLyrics) and 0 or 20)
+                if score < bestScore then best, bestScore = r, score end
+            end
+        end
+    end
+    return best and record(best) or nil
+end
+
+return lrclib

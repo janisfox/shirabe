@@ -18,6 +18,27 @@ local defaults = {
         dim = 0.35,         -- 0..0.9
         animate = true,     -- play animated backgrounds
     },
+    -- Audio FX (state/fx). eq: 10 bands in dB, 31 Hz .. 16 kHz.
+    fx = {
+        speed = 1,          -- 0.5 .. 2
+        pitch = 0,          -- semitones, -12 .. 12 (ignored while linked)
+        link = false,       -- pitch follows speed (nightcore / slowed)
+        reverb = 0,         -- wet mix 0 .. 1
+        decay = 2.4,        -- seconds
+        preDelay = 0.02,    -- seconds
+        eq = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        loudness = false,   -- gentle compressor + make-up gain
+        preamp = 0,         -- dB
+    },
+    appearance = {
+        accent = "cover",   -- "cover" (follows the artwork) | "#rrggbb"
+        tone = "dark",      -- "dark" (light text) | "light" (dark text)
+        glass = 0.88,       -- panel opacity 0.4 .. 1
+        radius = 14,        -- panel corner radius, 0 .. 24
+    },
+    playback = {
+        volume = 1,
+    },
 }
 
 local dir = os.configDir("shirabe")

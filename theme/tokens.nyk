@@ -19,21 +19,55 @@ tokens.radius = {
     button = 8,
 }
 
-tokens.color = {
-    text = 0xF2F2F0FF,
-    textDim = 0xF2F2F0A6,
-    textFaint = 0xF2F2F066,
-    panel = 0x0A0A0BE0,         -- rail / player bar: near-black glass
-    panelBorder = 0xFFFFFF14,
-    surface = 0xFFFFFF14,       -- chips, inputs, idle buttons on the wallpaper
-    surfaceHover = 0xFFFFFF24,
-    surfaceActive = 0xF2F2F0FF, -- the selected chip (light pill, dark text)
-    textOnActive = 0x111113FF,
-    hover = 0xFFFFFF14,
-    danger = 0xE5484DFF,
-    skeleton = 0xFFFFFF10,
-    shade = 0x00000059,         -- dims the wallpaper behind content
+-- Colors for the two text tones (Settings > Appearance). Pages read
+-- tokens.color at draw time, so theme/appearance can swap the palette in place.
+tokens.palettes = {
+    dark = {
+        text = 0xF2F2F0FF,
+        textDim = 0xF2F2F0A6,
+        textFaint = 0xF2F2F066,
+        panel = 0x0A0A0BE0,         -- rail / player bar: near-black glass
+        panelBorder = 0xFFFFFF14,
+        popover = 0x16161AF2,       -- menus, popovers, the queue panel
+        surface = 0xFFFFFF14,       -- chips, inputs, idle buttons on the wallpaper
+        surfaceHover = 0xFFFFFF24,
+        surfaceActive = 0xF2F2F0FF, -- the selected chip (light pill, dark text)
+        textOnActive = 0x111113FF,
+        hover = 0xFFFFFF14,
+        danger = 0xE5484DFF,
+        skeleton = 0xFFFFFF10,
+        shade = 0x00000059,         -- dims the wallpaper behind content
+        backdrop = 0x0B0B0EFF,      -- under the now-playing view
+    },
+    light = {
+        text = 0x17171AFF,
+        textDim = 0x17171AA6,
+        textFaint = 0x17171A70,
+        panel = 0xF5F5F3E0,
+        panelBorder = 0x0000001A,
+        popover = 0xF7F7F5F2,
+        surface = 0x00000012,
+        surfaceHover = 0x00000020,
+        surfaceActive = 0x17171AFF,
+        textOnActive = 0xF5F5F3FF,
+        hover = 0x00000012,
+        danger = 0xD13438FF,
+        skeleton = 0x0000000F,
+        shade = 0xFFFFFF40,
+        backdrop = 0xF2F2F0FF,
+    },
 }
+
+tokens.color = table.clone(tokens.palettes.dark)
+tokens.color.accent = 0xF2F2F0FF        -- progress, sliders, switches (may follow the cover)
+tokens.color.textOnAccent = 0x111113FF
+tokens.light = false
+
+-- A translucent wash of the text color: white on the dark tone, black on the
+-- light one. `alpha` is 0..255.
+function tokens.wash(alpha: number): number
+    return (tokens.light and 0x00000000 or 0xFFFFFF00) + alpha
+end
 
 tokens.motion = {
     page = 0.22,        -- page cross-fade

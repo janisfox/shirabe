@@ -14,6 +14,10 @@ local MAX_CACHED = 220
 local FADE = 0.25
 
 local cache = {}       -- url -> { image?, status, used, loadedAt }
+-- thumbnails list -> { [size] = url }: picking the URL scans the strings, and
+-- every visible card asks for its artwork every frame. Weak keys let the
+-- lists of pages that are gone be collected.
+local urls = setmetatable({}, { __mode = "k" })
 local queue = {}       -- urls waiting for a slot
 local loading = 0
 local count = 0
@@ -65,8 +69,18 @@ end
 -- size times the window scale for sharp HiDPI art), or nil while loading.
 function images.get(thumbnails: {table}?, size: number): (any, number)
     if not thumbnails or #thumbnails == 0 then return nil, 0 end
-    local url = P.thumbnailUrl(thumbnails, size)
-    if not url then return nil, 0 end
+    local px = math.floor(size)
+    local known = urls[thumbnails]
+    if not known then
+        known = {}
+        urls[thumbnails] = known
+    end
+    local url = known[px]
+    if not url then
+        url = P.thumbnailUrl(thumbnails, px)
+        if not url then return nil, 0 end
+        known[px] = url
+    end
     local entry = cache[url]
     if not entry then
         entry = { status = "queued", used = os.clock() }

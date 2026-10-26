@@ -1,6 +1,7 @@
 -- The shirabe mark, drawn from the pixel grid in its SVG (a set of squares), so
 -- it is sharp at any size and each pixel can be animated on its own.
 
+local ui = require("@neyuki/ui")
 local fs = require("@neyuki/fs")
 
 local logo = {}
@@ -19,10 +20,30 @@ function logo.load(path: string)
     end
 end
 
+local still = nil      -- the finished mark, cached in a canvas
+local stillKey = nil
+
 -- Draws the mark in a `size` x `size` box. `progress` (0..1, default 1) plays
--- the intro: pixels pop in from the left with a short stagger.
+-- the intro: pixels pop in from the left with a short stagger. Once the intro
+-- is over the mark is a cached canvas (it is drawn every frame).
 function logo.draw(target: any, x: number, y: number, size: number, color: any, progress: number?)
     local p = progress ?? 1
+    if p >= 1 then
+        local scale = target:scale()
+        local key = `{size}|{color}|{scale}`
+        if key ~= stillKey then
+            if still then still:close() end
+            still = ui.canvas(size, size, { scale = scale })
+            logo.paint(still, 0, 0, size, color, 1)
+            stillKey = key
+        end
+        target:drawImage(still, x, y)
+        return
+    end
+    logo.paint(target, x, y, size, color, p)
+end
+
+function logo.paint(target: any, x: number, y: number, size: number, color: any, p: number)
     local s = size / extent
     for _, cell in cells do
         local local_t = math.clamp((p * 1.6) - (cell.x / extent) * 0.6, 0, 1)

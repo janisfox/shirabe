@@ -1,0 +1,48 @@
+# Milestones 5 and 6: now playing, lyrics, queue, context menu, FX popover.
+# Run muted: SHIRABE_TEST_MUTE=1. Plays "Tragedy" (already in the history).
+wait 9
+key k ctrl
+wait 0.4
+type Tragedy STOMACH BOOK
+key enter
+wait 5
+# Right-click a song row ("Let You Down"): context menu, closed with escape.
+rclick 400 490
+wait 0.6
+snap n1-menu
+key escape
+wait 0.3
+click 760 267
+wait 7
+# Open the now-playing view from the cover in the player bar.
+click 100 761
+wait 5
+snap n2-nowplaying
+# Click the second lyric line: seeks to 0:49.
+click 700 161
+wait 2.5
+snap n3-lyrics-seeked
+# Queue panel.
+click 1211 761
+wait 2
+snap n4-queue
+click 1211 761
+wait 0.6
+# FX popover: Nightcore (speed 1.25, linked pitch), then the Hall reverb.
+click 1177 761
+wait 1
+click 1052 320
+wait 0.5
+click 1066 532
+wait 1.5
+snap n5-fx
+click 1226 277
+wait 1
+key escape
+wait 0.5
+snap n6-np-still-open
+key escape
+wait 1
+key space
+wait 1
+quit

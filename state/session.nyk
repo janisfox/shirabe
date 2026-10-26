@@ -98,6 +98,17 @@ function session.switchTo(account: table)
     bridge.send("navigate", { url = "https://music.youtube.com" .. account.signinUrl })
 end
 
+-- Signs out of YouTube Music: forgets the page's cookies and storage and
+-- reloads it, which then reports "signed out".
+function session.signOut()
+    bridge.view:clearData()
+    settings.values.account = nil
+    settings.save()
+    session.accounts, session.account = nil, nil
+    session.status = "connecting"
+    bridge.view:navigate("https://music.youtube.com/")
+end
+
 function session.ready(): boolean
     return session.status == "ready"
 end

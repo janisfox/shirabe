@@ -2,7 +2,8 @@
 -- flows can be exercised and captured without touching the real mouse or
 -- keyboard. One command per line ("#" starts a comment):
 --   wait <seconds>            move <x> <y>           click <x> <y>
---   dbl <x> <y>               scroll <x> <y> <dy>    type <text...>
+--   dbl <x> <y>               rclick <x> <y>         scroll <x> <y> <dy>
+--   type <text...>
 --   key <name> [ctrl]         snap <name>            quit
 
 local fs = require("@neyuki/fs")
@@ -61,6 +62,13 @@ function script.step(dt: number, onSnap: (string) -> any, onQuit: () -> any): {t
             table.insert(frames, { { kind = "mouseup", button = "left", x = n[1], y = n[2] } })
         end
         pending = frames
+        return table.remove(pending, 1)
+    elseif c == "rclick" then
+        pending = {
+            { { kind = "mousemove", x = n[1], y = n[2] } },
+            { { kind = "mousedown", button = "right", x = n[1], y = n[2], clicks = 1 } },
+            { { kind = "mouseup", button = "right", x = n[1], y = n[2] } },
+        }
         return table.remove(pending, 1)
     elseif c == "scroll" then
         return { { kind = "mousemove", x = n[1], y = n[2] }, { kind = "scroll", dx = 0, dy = n[3], unit = "pixels", x = n[1], y = n[2] } }

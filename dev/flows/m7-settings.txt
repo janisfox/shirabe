@@ -1,0 +1,37 @@
+# Milestone 7: the settings window. Run with SHIRABE_TEST_NOPLAY=1 (and
+# SHIRABE_TEST_MUTE=1): nothing may play or be written to the account. The
+# window is centered: at 1280 x 800 it spans x 180..1100, y 80..720.
+wait 8
+key , ctrl
+wait 0.8
+snap s1-playback
+click 290 241
+wait 0.6
+snap s2-fx
+scroll 700 400 -700
+wait 0.6
+snap s3-fx-eq
+click 290 279
+wait 0.6
+snap s4-appearance
+click 290 317
+wait 0.6
+snap s5-background
+click 290 355
+wait 1.5
+snap s6-youtube
+click 290 393
+wait 0.6
+snap s7-storage
+click 290 431
+wait 0.6
+snap s8-about
+click 290 154
+type blur
+wait 0.6
+snap s9-search
+key escape
+key escape
+wait 0.8
+snap s10-closed
+quit

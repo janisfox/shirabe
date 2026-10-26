@@ -1,6 +1,7 @@
 -- Frosted-glass panels: blur what is already drawn under a rectangle, tint it
 -- and give it a hairline border, like a CSS backdrop-filter.
 
+local ui = require("@neyuki/ui")
 local tokens = require("theme/tokens")
 
 local glass = {}
@@ -11,8 +12,11 @@ function glass.panel(target: any, x: number, y: number, w: number, h: number, op
     local o = options ?? {}
     local radius = o.radius ?? tokens.radius.panel
     local blur = o.blur ?? 24
-    if blur > 0 then target:blurRegion(x, y, w, h, blur, { radius = radius }) end
-    target:fillRect(x, y, w, h, o.tint ?? tokens.color.panel, { radius = radius })
+    local tint = ui.color(o.tint ?? tokens.color.panel)
+    -- Under a nearly opaque tint the blur cannot be seen, and it is the most
+    -- expensive thing a frame can draw: skip it there.
+    if blur > 0 and tint % 256 < 0xE6 then target:blurRegion(x, y, w, h, blur, { radius = radius }) end
+    target:fillRect(x, y, w, h, tint, { radius = radius })
     if o.border ~= false then
         target:strokeRect(x + 0.5, y + 0.5, w - 1, h - 1, o.border ?? tokens.color.panelBorder, { radius = radius, width = 1 })
     end

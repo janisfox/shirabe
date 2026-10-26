@@ -1,0 +1,157 @@
+-- Lyrics of the playing track. Providers, first hit wins:
+--   1. LRCLIB synced lyrics (YouTube Music's web client only has plain text:
+--      timed lyrics need the Android client, which the page cannot ask as)
+--   2. YouTube Music's own lyrics (plain, usually from Musixmatch)
+--   3. LRCLIB plain lyrics
+-- Results (and "none") are cached per video under the cache directory, with a
+-- per-track timing offset the user can nudge.
+
+local fs = require("@neyuki/fs")
+local lrc = require("services/lyrics/lrc")
+local lrclib = require("services/lyrics/lrclib")
+local api = require("services/ytm/api")
+
+local lyrics = {}
+
+local dir = fs.join(os.cacheDir("shirabe"), "lyrics")
+local NONE_RETRY = 3 * 24 * 3600   -- seconds before a track without lyrics is asked again
+local entries = {}                 -- videoId -> { status, value?, record }
+
+local function path(videoId: string): string
+    return fs.join(dir, (string.gsub(videoId, "[^%w_%-]", "_")) .. ".json")
+end
+
+local function readCache(videoId: string): table?
+    local file = path(videoId)
+    if not fs.exists(file) then return nil end
+    local ok, value = pcall(json.decode, fs.read(file))
+    if not ok or type(value) ~= "table" then return nil end
+    if value.kind == "none" and os.time() - (value.fetchedAt ?? 0) > NONE_RETRY then return nil end
+    return value
+end
+
+local function writeCache(videoId: string, record: table)
+    fs.mkdir(dir, true)
+    fs.write(path(videoId), json.encode(record))
+end
+
+-- A cached record -> what the view draws.
+local function build(record: table): table?
+    if record.kind == "lrc" then
+        local parsed = lrc.parse(record.text)
+        if #parsed.lines == 0 then return nil end
+        return { synced = true, lines = parsed.lines, source = record.source, offset = record.offset ?? 0 }
+    elseif record.kind == "plain" then
+        return { synced = false, lines = lrc.plain(record.text).lines, source = record.source, offset = 0 }
+    end
+    return nil
+end
+
+-- Titles of music videos carry extras LRCLIB does not know.
+local function cleanTitle(title: string): string
+    local t = title
+    t = string.gsub(t, "%s*[%(%[][^%)%]]*[Oo]fficial[^%)%]]*[%)%]]", "")
+    t = string.gsub(t, "%s*[%(%[][^%)%]]*[Ll]yric[^%)%]]*[%)%]]", "")
+    t = string.gsub(t, "%s*[%(%[][^%)%]]*[Aa]udio[^%)%]]*[%)%]]", "")
+    t = string.gsub(t, "%s*[%(%[][^%)%]]*[Vv]ideo[^%)%]]*[%)%]]", "")
+    return (string.match(t, "^%s*(.-)%s*$"))
+end
+
+-- Runs `fn` in its own task and waits for it; a failure (an error inside
+-- `fn`) gives nil instead of ending the caller. (Not a pcall: inside one,
+-- the waits in http and bridge calls block instead of yielding.)
+local function attempt(fn: () -> any): any
+    local box = { done = false }
+    local thread = task.spawn(function()
+        box.value = fn()
+        box.done = true
+    end)
+    while not box.done and coroutine.status(thread) ~= "dead" do task.wait(0.05) end
+    return box.value
+end
+
+local function fetch(track: table): table
+    local artist = (track.artists and track.artists[1] and track.artists[1].name) ?? ""
+    local title = (track.kind == "video") and cleanTitle(track.title) or track.title
+    local album = track.album and track.album.name
+    local found = attempt(function() return lrclib.find(title, artist, album, track.duration) end)
+    if found and found.synced then
+        return { kind = "lrc", text = found.synced, source = "LRCLIB", offset = 0 }
+    end
+    local ytm = attempt(function()
+        local watch = api.watch(track.videoId)
+        if not watch.lyrics then return nil end
+        return api.lyrics(watch.lyrics)
+    end)
+    if ytm and ytm.text then
+        return { kind = "plain", text = ytm.text, source = ytm.source ?? "YouTube Music" }
+    end
+    if found and found.plain then
+        return { kind = "plain", text = found.plain, source = "LRCLIB" }
+    end
+    if found and found.instrumental then return { kind = "none", instrumental = true } end
+    return { kind = "none" }
+end
+
+-- The lyrics entry for a track: { status = "loading" | "ready" | "none", value? }.
+-- `track` needs videoId, title, artists, duration (album optional).
+function lyrics.get(track: table?): table?
+    if not track or not track.videoId then return nil end
+    local id = track.videoId
+    local entry = entries[id]
+    if entry then return entry end
+    entry = { status = "loading" }
+    entries[id] = entry
+    local cached = readCache(id)
+    if cached then
+        entry.record = cached
+        entry.value = build(cached)
+        entry.status = entry.value and "ready" or "none"
+        entry.instrumental = cached.instrumental
+        return entry
+    end
+    -- The duration of autoplayed tracks arrives with their details; wait a
+    -- moment for it so LRCLIB's exact lookup can be used.
+    entry.thread = task.spawn(function()
+        local player = require("state/player")
+        local waited = 0
+        local t = track
+        while waited < 4 do
+            -- The player swaps in a fuller copy of the track once its details arrive.
+            if player.track and player.track.videoId == id then t = player.track end
+            local duration = (t.duration ?? 0) > 0 and t.duration or ((player.track == t) and player.duration or 0)
+            if duration > 0 and t.artists and t.artists[1] and t.artists[1].name ~= "" then
+                t = table.clone(t)
+                t.duration = duration
+                break
+            end
+            waited += task.wait(0.25)
+        end
+        local record = fetch(t)
+        record.fetchedAt = os.time()
+        writeCache(id, record)
+        entry.record = record
+        entry.value = build(record)
+        entry.status = entry.value and "ready" or "none"
+        entry.instrumental = record.instrumental
+    end)
+    return entry
+end
+
+-- Moves the lyrics of a track earlier (negative) or later in time and
+-- remembers it.
+function lyrics.nudge(videoId: string, seconds: number)
+    local entry = entries[videoId]
+    if not entry or not entry.value or not entry.record then return end
+    entry.record.offset = math.round(((entry.record.offset ?? 0) + seconds) * 100) / 100
+    entry.value.offset = entry.record.offset
+    writeCache(videoId, entry.record)
+end
+
+-- Forgets cached lyrics (Settings > Storage).
+function lyrics.clearCache()
+    entries = {}
+    if fs.exists(dir) then fs.remove(dir, true) end
+end
+
+return lyrics

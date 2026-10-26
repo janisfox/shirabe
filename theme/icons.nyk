@@ -110,20 +110,77 @@ local defs = {
         P.circle(5, 7, 0.6).circle(5, 12, 0.6).circle(5, 17, 0.6)
     end },
     plus = { kind = "stroke", build = function(P) P.line(12, 5, 12, 19).line(5, 12, 19, 12) end },
+    minus = { kind = "stroke", build = function(P) P.line(5, 12, 19, 12) end },
+    check = { kind = "stroke", build = function(P) P.m(5, 12.5).l(10, 17.5).l(19, 7) end },
+    chevronDown = { kind = "stroke", build = function(P) P.m(6, 9.5).l(12, 15.5).l(18, 9.5) end },
+    chevronUp = { kind = "stroke", build = function(P) P.m(6, 14.5).l(12, 8.5).l(18, 14.5) end },
+    -- Audio FX: three sliders.
+    sliders = { kind = "stroke", build = function(P)
+        P.line(4, 7, 20, 7).line(4, 12, 20, 12).line(4, 17, 20, 17)
+        P.circle(9, 7, 1.9).circle(15, 12, 1.9).circle(7.5, 17, 1.9)
+    end },
+    dots = { kind = "fill", build = function(P)
+        P.circle(5.5, 12, 1.7).circle(12, 12, 1.7).circle(18.5, 12, 1.7)
+    end },
+    radio = { kind = "stroke", build = function(P)
+        P.circle(12, 12, 2.2)
+        P.m(7.8, 7.8).q(4.4, 12, 7.8, 16.2).m(16.2, 7.8).q(19.6, 12, 16.2, 16.2)
+        P.m(5, 5).q(-0.6, 12, 5, 19).m(19, 5).q(24.6, 12, 19, 19)
+    end },
+    expand = { kind = "stroke", build = function(P)
+        P.m(14, 4.5).l(19.5, 4.5).l(19.5, 10).m(19.5, 4.5).l(13.5, 10.5)
+        P.m(10, 19.5).l(4.5, 19.5).l(4.5, 14).m(4.5, 19.5).l(10.5, 13.5)
+    end },
+    drag = { kind = "fill", build = function(P)
+        P.circle(9, 7, 1.4).circle(15, 7, 1.4).circle(9, 12, 1.4).circle(15, 12, 1.4).circle(9, 17, 1.4).circle(15, 17, 1.4)
+    end },
+    user = { kind = "stroke", build = function(P)
+        P.circle(12, 8.5, 4).m(4.5, 20).q(4.5, 13.5, 12, 13.5).q(19.5, 13.5, 19.5, 20)
+    end },
+    timer = { kind = "stroke", build = function(P)
+        P.circle(12, 13, 7.5).line(12, 13, 12, 9).line(10, 3, 14, 3)
+    end },
 }
+
+-- Builds and draws an icon's path (the costly part; see icons.draw).
+local function paint(target: any, def: table, x: number, y: number, size: number, color: any, filled: boolean, width: number)
+    local P = pen(x, y, size / 24)
+    def.build(P)
+    if filled then
+        target:fillPath(P.path, color)
+    else
+        target:strokePath(P.path, color, { width = width * size / 24, cap = "round", join = "round" })
+    end
+end
+
+-- Rendered icons, one canvas per name, size, color, style and scale. Paths
+-- are rebuilt from script code, which is slow next to blitting a canvas, and
+-- the same few icons are drawn every frame.
+local cache = {}
+local cached = 0
+local PAD = 2   -- strokes reach a little past the 24-unit box
 
 function icons.draw(target: any, name: string, x: number, y: number, size: number, color: any, options: table?)
     local def = defs[name]
     if not def then error(`unknown icon {name}`) end
-    local P = pen(x, y, size / 24)
-    def.build(P)
-    local filled = def.kind == "fill" or (def.kind == "both" and options and options.filled)
-    if filled then
-        target:fillPath(P.path, color)
-    else
-        local width = (options and options.width) ?? 1.8
-        target:strokePath(P.path, color, { width = width * size / 24, cap = "round", join = "round" })
+    local filled = def.kind == "fill" or (def.kind == "both" and options ~= nil and options.filled == true)
+    local width = (options and options.width) ?? 1.8
+    local s = math.round(size * 2) / 2   -- sizes animate (presses); half pixels are close enough
+    local packed = ui.color(color)
+    local scale = target:scale()
+    local key = `{name}|{s}|{packed}|{filled}|{width}|{scale}`
+    local canvas = cache[key]
+    if not canvas then
+        if cached >= 300 then
+            for _, c in pairs(cache) do c:close() end
+            cache, cached = {}, 0
+        end
+        canvas = ui.canvas(s + PAD * 2, s + PAD * 2, { scale = scale })
+        paint(canvas, def, PAD, PAD, s, packed, filled, width)
+        cache[key] = canvas
+        cached += 1
     end
+    target:drawImage(canvas, x - PAD + (size - s) / 2, y - PAD + (size - s) / 2)
 end
 
 return icons

@@ -1,0 +1,89 @@
+-- LRC parsing. `lrc.parse(text)` -> { lines = { { t, text, words? } }, offset }
+-- with `t` in seconds, sorted by time. Lines may carry several time tags
+-- ("[00:12.00][01:30.00]chorus"); enhanced LRC word tags ("<00:12.40>word")
+-- become `words = { { t, text } }`. `[offset:+250]` (milliseconds, positive
+-- = earlier) is applied to every time.
+
+local lrc = {}
+
+local function seconds(m: string, s: string): number
+    return tonumber(m) * 60 + tonumber(s)
+end
+
+local function trim(s: string): string
+    return string.match(s, "^%s*(.-)%s*$")
+end
+
+-- Splits "<mm:ss.xx>word <mm:ss.xx>word" into timed words.
+local function words(body: string): ({table}?, string)
+    if not string.find(body, "<%d+:%d+[%.:]?%d*>") then return nil, body end
+    local out = {}
+    for tagged in string.gmatch(body, "<%d+:%d+[%.]?%d*>[^<]*") do
+        local m, s, piece = string.match(tagged, "^<(%d+):(%d+[%.]?%d*)>(.*)$")
+        if m and piece ~= "" then table.insert(out, { t = seconds(m, s), text = piece }) end
+    end
+    local plain = trim((string.gsub(body, "<%d+:%d+[%.:]?%d*>", "")))
+    if #out == 0 then return nil, plain end
+    return out, plain
+end
+
+function lrc.parse(text: string): table
+    local lines = {}
+    local offset = 0
+    for raw in string.gmatch(text .. "\n", "([^\n]*)\n") do
+        local line = string.gsub(raw, "\r", "")
+        local tag = string.match(line, "^%[offset:%s*([%+%-]?%d+)%]")
+        if tag then offset = tonumber(tag) / 1000 end
+        local times = {}
+        local rest = line
+        while true do
+            local m, s, after = string.match(rest, "^%[(%d+):(%d+[%.:]?%d*)%](.*)$")
+            if not m then break end
+            table.insert(times, seconds(m, (string.gsub(s, ":", "."))))
+            rest = after
+        end
+        if #times > 0 then
+            local w, plain = words(rest)
+            for _, t in times do
+                table.insert(lines, { t = t, text = trim(plain), words = w })
+            end
+        end
+    end
+    table.sort(lines, function(a, b) return a.t < b.t end)
+    for _, l in lines do
+        l.t -= offset
+        if l.words then
+            for _, w in l.words do w.t -= offset end
+        end
+    end
+    return { lines = lines, offset = offset }
+end
+
+-- Plain (untimed) lyrics as lines.
+function lrc.plain(text: string): table
+    local lines = {}
+    for raw in string.gmatch(text .. "\n", "([^\n]*)\n") do
+        table.insert(lines, { text = trim((string.gsub(raw, "\r", ""))) })
+    end
+    -- Drop leading / trailing blank lines.
+    while lines[1] and lines[1].text == "" do table.remove(lines, 1) end
+    while lines[#lines] and lines[#lines].text == "" do table.remove(lines) end
+    return { lines = lines }
+end
+
+-- Index of the line playing at `t` (the last one that has started), or 0.
+function lrc.active(lines: {table}, t: number): number
+    local lo, hi, found = 1, #lines, 0
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        if (lines[mid].t ?? math.huge) <= t then
+            found = mid
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return found
+end
+
+return lrc

@@ -1,0 +1,129 @@
+-- Audio FX settings (speed, pitch, link, reverb, EQ, loudness, pre-amp). They
+-- live in settings.fx, are applied by the page's Web Audio graph (see
+-- assets/bridge.js "AUDIO FX") and are sent again whenever the page reloads.
+-- While a slider moves, updates go out at most every 50 ms.
+
+local bridge = require("services/ytm/bridge")
+local settings = require("state/settings")
+local player = require("state/player")
+
+local fx = {}
+
+fx.BANDS = { "31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k" }
+
+fx.REVERBS = {
+    { name = "Off", reverb = 0 },
+    { name = "Room", reverb = 0.18, decay = 0.8, preDelay = 0.01 },
+    { name = "Hall", reverb = 0.26, decay = 2.4, preDelay = 0.03 },
+    { name = "Cathedral", reverb = 0.34, decay = 5, preDelay = 0.05 },
+}
+
+fx.EQS = {
+    { name = "Flat", eq = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+    { name = "Bass", eq = { 6, 5, 4, 2, 0, 0, 0, 0, 0, 0 } },
+    { name = "Vocal", eq = { -2, -1, 0, 1, 3, 4, 3, 1, 0, -1 } },
+    { name = "Treble", eq = { 0, 0, 0, 0, 0, 1, 2, 4, 5, 6 } },
+    { name = "Loudness", eq = { 5, 4, 2, 0, -1, -1, 0, 2, 4, 5 } },
+}
+
+-- Whole-sound presets ("nightcore", "slowed + reverb").
+fx.MOODS = {
+    { name = "Normal", speed = 1, pitch = 0, link = false, reverb = 0 },
+    { name = "Nightcore", speed = 1.25, link = true, reverb = 0 },
+    { name = "Slowed + reverb", speed = 0.85, link = true, reverb = 0.35, decay = 3.2, preDelay = 0.03 },
+    { name = "Daycore", speed = 0.8, link = true, reverb = 0.12, decay = 1.6, preDelay = 0.02 },
+}
+
+local lastSent = 0
+local dirty = false
+
+function fx.values(): table
+    return settings.values.fx
+end
+
+-- Pitch in semitones as heard: with link on it follows the speed.
+function fx.heardPitch(): number
+    local v = settings.values.fx
+    if v.link then return 12 * math.log(v.speed) / math.log(2) end
+    return v.pitch
+end
+
+-- Anything not neutral (the FX button lights up).
+function fx.active(): boolean
+    local v = settings.values.fx
+    if v.speed ~= 1 or v.pitch ~= 0 or v.reverb > 0 or v.loudness or v.preamp ~= 0 then return true end
+    for _, g in v.eq do
+        if g ~= 0 then return true end
+    end
+    return false
+end
+
+local function send()
+    local v = settings.values.fx
+    player.speed = v.speed
+    if not bridge.isOpen() then return end
+    bridge.send("fx", {
+        speed = v.speed, pitch = v.pitch, link = v.link, eq = v.eq, reverb = v.reverb, decay = v.decay,
+        preDelay = v.preDelay, loudness = v.loudness, preamp = v.preamp,
+    })
+    lastSent = os.clock()
+    dirty = false
+end
+
+-- Marks a change; `commit` (end of a drag, a button) also saves the settings.
+function fx.changed(commit: boolean?)
+    dirty = true
+    if os.clock() - lastSent > 0.05 then send() end
+    if commit then
+        send()
+        settings.save()
+    end
+end
+
+-- Once a frame: sends a change that was held back by the rate limit.
+function fx.update()
+    if dirty and os.clock() - lastSent > 0.05 then send() end
+end
+
+-- After the page (re)loads: its graph starts neutral.
+function fx.reapply()
+    send()
+end
+
+function fx.set(patch: table, commit: boolean?)
+    local v = settings.values.fx
+    for k, value in pairs(patch) do
+        if k ~= "name" then v[k] = value end
+    end
+    fx.changed(commit ?? true)
+end
+
+function fx.reset()
+    fx.set({ speed = 1, pitch = 0, link = false, reverb = 0, decay = 2.4, preDelay = 0.02,
+        eq = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, loudness = false, preamp = 0 })
+end
+
+-- Index of the preset in `list` that matches the current values, or nil.
+function fx.matching(list: {table}): number?
+    local v = settings.values.fx
+    for i, preset in list do
+        local same = true
+        for k, value in pairs(preset) do
+            if k ~= "name" then
+                if type(value) == "table" then
+                    for j, g in value do
+                        if v[k][j] ~= g then same = false end
+                    end
+                elseif type(value) == "number" then
+                    if math.abs((v[k] ?? 0) - value) > 0.001 then same = false end
+                elseif v[k] ~= value then
+                    same = false
+                end
+            end
+        end
+        if same then return i end
+    end
+    return nil
+end
+
+return fx

@@ -1,0 +1,86 @@
+-- The play queue, mirrored from YouTube Music's own (the page pushes it on
+-- every change; see assets/bridge.js "QUEUE"). Changes go back to the page,
+-- which applies them to its store, and the next push shows the result.
+-- Indices here are 1-based; the page's are 0-based.
+
+local bridge = require("services/ytm/bridge")
+local P = require("services/ytm/parse/common")
+local player = require("state/player")
+
+local queue = {}
+
+queue.items = {}        -- normalized items (P.item), each with `index` (1-based)
+queue.automix = {}      -- what autoplay adds after the queue ("Up next" suggestions)
+queue.selected = nil    -- index of the playing entry
+queue.version = 0       -- bumps on every push (pages cache layouts by it)
+
+local function parse(list: any): {table}
+    local out = {}
+    if type(list) ~= "table" then return out end
+    for i, raw in list do
+        local item = (type(raw) == "table") and P.item(raw) or nil
+        if item then
+            item.index = i
+            table.insert(out, item)
+        end
+    end
+    return out
+end
+
+-- The page's push (bridge.onQueue).
+function queue.onPush(msg: table)
+    queue.items = parse(msg.items)
+    queue.automix = parse(msg.automix)
+    queue.selected = (type(msg.selected) == "number") and (msg.selected + 1) or nil
+    player.shuffle = msg.shuffle == true
+    local repeatMode = ({ NONE = "off", ALL = "all", ONE = "one" })[msg["repeat"] ?? "NONE"] ?? "off"
+    player["repeat"] = repeatMode
+    queue.version += 1
+end
+
+-- Entries after the playing one.
+function queue.upcoming(): {table}
+    local out = {}
+    for _, item in queue.items do
+        if not queue.selected or item.index > queue.selected then table.insert(out, item) end
+    end
+    return out
+end
+
+function queue.playAt(index: number)
+    bridge.send("queuePlay", { index = index - 1 })
+end
+
+function queue.remove(index: number)
+    bridge.send("queueRemove", { index = index - 1 })
+end
+
+function queue.move(from: number, to: number)
+    if from == to then return end
+    bridge.send("queueMove", { from = from - 1, to = to - 1 })
+end
+
+-- Adds tracks after the playing one ("next") or at the end ("end").
+function queue.add(videoIds: {string}, position: string)
+    bridge.send("queueAdd", { videoIds = videoIds, position = position })
+end
+
+function queue.clearUpcoming()
+    bridge.send("queueClear")
+end
+
+function queue.toggleShuffle()
+    player.shuffle = not player.shuffle
+    bridge.send("shuffle", { on = player.shuffle })
+end
+
+local NEXT_REPEAT = { off = "all", all = "one", one = "off" }
+local PAGE_REPEAT = { off = "NONE", all = "ALL", one = "ONE" }
+
+function queue.cycleRepeat()
+    local mode = NEXT_REPEAT[player["repeat"]] ?? "off"
+    player["repeat"] = mode
+    bridge.send("repeat", { mode = PAGE_REPEAT[mode] })
+end
+
+return queue

@@ -1,0 +1,37 @@
+-- Development aid: runs a JavaScript file inside the hidden YouTube Music page
+-- (muted) and prints whatever it posts back as { type = "probe", ... } for a
+-- while. For finding out how the page's internals look before relying on them.
+--   neyuki dev/probe.nyk <file.js> [seconds]
+
+local ui = require("@neyuki/ui")
+local fs = require("@neyuki/fs")
+local bridge = require("services/ytm/bridge")
+
+local file = os.args()[1] or error("usage: neyuki dev/probe.nyk <file.js> [seconds]")
+local seconds = tonumber(os.args()[2]) ?? 20
+local code = fs.read(file)
+
+bridge.open({ visible = false, mute = true })
+
+local started = nil
+local sent = false
+while bridge.isOpen() do
+    for _, event in ui.poll(0.05) do
+        if event.kind == "webview" then
+            bridge.handle(event)
+            if event.type == "message" then
+                local ok, msg = pcall(json.decode, event.data)
+                if ok and type(msg) == "table" and msg.type == "probe" then
+                    print(json.encode(msg.data ?? msg))
+                end
+            end
+        end
+    end
+    if bridge.loads > 0 and not sent then
+        sent = true
+        started = os.clock()
+        print(`page ready as {bridge.identity.pageId ?? "owner"}; running {file}`)
+        bridge.view:eval(code)
+    end
+    if started and os.clock() - started > seconds then bridge.close() end
+end

@@ -26,6 +26,14 @@ local titlebar = require("app/titlebar")
 local rail = require("app/rail")
 local playerbar = require("app/playerbar")
 local router = require("app/router")
+local settingsView = require("app/settings")
+local appearance = require("theme/appearance")
+local nowplaying = require("app/nowplaying")
+local queuepanel = require("app/queuepanel")
+local popovers = require("app/popovers")
+local menu = require("kit/menu")
+local queue = require("state/queue")
+local fx = require("state/fx")
 local harness = require("dev/harness")
 
 local C = tokens.color
@@ -51,6 +59,7 @@ local win = ui.open({
 -- SHIRABE_PROFILE points them at another web profile.
 session.start({ mute = os.getenv("SHIRABE_TEST_MUTE") ~= nil, profile = os.getenv("SHIRABE_PROFILE") })
 bridge.onState = playback.onState
+bridge.onQueue = queue.onPush
 
 router.register("home", require("pages/home"))
 router.register("search", require("pages/search"))
@@ -75,7 +84,7 @@ local function drawToast(L: table)
     local x = L.content.x + (L.content.w - w) / 2
     local y = L.playerbar.y - h - 14 + (1 - p) * 10
     win:pushOpacity(p)
-    glass.panel(win, x, y, w, h, { radius = 18, tint = 0x18181CEE })
+    glass.panel(win, x, y, w, h, { radius = 18, tint = C.popover })
     win:text(x + 16, y + 10, toast.text, { size = 13, font = fonts.medium, color = C.text })
     win:popOpacity()
 end
@@ -124,11 +133,62 @@ end
 
 ctx.playEndpoint = playback.playEndpoint
 
+-- Right-click menu for an item (`context` = the album / playlist a row plays in).
+function ctx.menu(item: table, _context: table?)
+    local entries = {}
+    local artist = item.artists and item.artists[1]
+    if media.isTrack(item) and item.videoId then
+        local id = item.videoId
+        table.insert(entries, { label = "Play next", icon = "next", act = function()
+            queue.add({ id }, "next")
+            showToast(`"{item.title}" plays next`)
+        end })
+        table.insert(entries, { label = "Add to queue", icon = "queue", act = function()
+            queue.add({ id }, "end")
+            showToast(`Added "{item.title}" to the queue`)
+        end })
+        table.insert(entries, { label = "Start radio", icon = "radio", act = function()
+            playback.playEndpoint({ kind = "watch", videoId = id, playlistId = "RDAMVM" .. id })
+        end })
+    elseif (item.kind == "album" or item.kind == "playlist") and (item.browseId or item.playlistId) then
+        table.insert(entries, { label = "Play", icon = "play", act = function() ctx.play(item) end })
+        for _, spec in { { "Play next", "next", "next" }, { "Add to queue", "queue", "end" } } do
+            table.insert(entries, { label = spec[1], icon = spec[2], act = function()
+                task.spawn(function()
+                    local id = item.browseId ?? item.playlistId
+                    local c = (item.kind == "album") and api.album(id) or api.playlist(id)
+                    local ids = {}
+                    for _, t in c.tracks do
+                        if t.videoId and #ids < 200 then table.insert(ids, t.videoId) end
+                    end
+                    if #ids > 0 then queue.add(ids, spec[3]) end
+                end)
+                showToast(`Adding "{item.title}" to the queue…`)
+            end })
+        end
+    end
+    if artist and artist.id and item.kind ~= "artist" then
+        table.insert(entries, { label = "Go to artist", icon = "user", act = function()
+            ctx.open({ kind = "artist", browseId = artist.id })
+        end })
+    end
+    if item.album and item.album.id then
+        table.insert(entries, { label = "Go to album", icon = "library", act = function()
+            ctx.open({ kind = "album", browseId = item.album.id })
+        end })
+    end
+    if item.kind == "album" or item.kind == "playlist" or item.kind == "artist" then
+        table.insert(entries, { label = "Open", icon = "expand", act = function() ctx.open(item) end })
+    end
+    menu.show(entries, input.mx, input.my)
+end
+
 local actions = {
     toggle = playback.toggle,
     next = playback.next,
     prev = playback.prev,
     seek = playback.seek,
+    now = playback.now,
     like = function()
         local track = player.track
         if not track or not track.videoId then return end
@@ -138,19 +198,30 @@ local actions = {
         task.spawn(function() api.rate(videoId, status) end)
         loader.forgetPrefix("playlist:LM")
     end,
-    shuffle = function() showToast("Shuffle and repeat arrive with the now-playing view (milestone 5).") end,
-    cycleRepeat = function() showToast("Shuffle and repeat arrive with the now-playing view (milestone 5).") end,
-    toggleLyrics = function() showToast("Lyrics arrive with the now-playing view (milestone 5).") end,
-    toggleQueue = function() showToast("The queue arrives with the now-playing view (milestone 5).") end,
+    shuffle = queue.toggleShuffle,
+    cycleRepeat = queue.cycleRepeat,
+    toggleLyrics = function() nowplaying.open = not nowplaying.open end,
+    lyricsOpen = function() return nowplaying.open end,
+    openNowPlaying = function() nowplaying.open = true end,
+    toggleQueue = function() queuepanel.open = not queuepanel.open end,
+    queueOpen = function() return queuepanel.open end,
+    toggleFx = function() popovers.toggle("fx") end,
+    fxOpen = function() return popovers.which == "fx" end,
+    fxActive = fx.active,
+    toggleVolume = function() popovers.toggle("volume") end,
+    volumeOpen = function() return popovers.which == "volume" end,
 }
 
-local function openSettings()
-    showToast("Settings arrive in milestone 7. Tip: drop an image or GIF on the window to set the background.")
+local accountMenu = false
+
+local function openSettings(section: string?)
+    accountMenu = false
+    popovers.which = nil
+    menu.close()
+    if settingsView.open and not section then settingsView.open = false else settingsView.show(section) end
 end
 
 -- ACCOUNT SWITCHER -----------------------------------------------------------
-
-local accountMenu = false
 
 local function accountInfo(): table?
     local a = session.account
@@ -163,15 +234,17 @@ local function drawAccountMenu(L: table)
     if p < 0.01 then return end
     local list = session.accounts ?? {}
     local w = 280
-    local h = 52 + math.max(1, #list) * 52 + (session.status == "signedOut" and 44 or 0)
+    local h = 52 + math.max(1, #list) * 52 + (session.status == "signedOut" and 44 or 0) + 44
     local x = L.rail.x + L.rail.w + 10
     local y = L.rail.y + L.rail.h - h + (1 - p) * 8
-    -- Clicks outside close it.
-    if input.pressed and not (input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h) then
+    -- Clicks outside close it (except on the rail, whose avatar toggles it).
+    local inside = input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h
+    if input.pressed and not inside and input.mx >= L.rail.x + L.rail.w then
         accountMenu = false
     end
     win:pushOpacity(p)
-    glass.panel(win, x, y, w, h, { radius = 14, tint = 0x16161AF2, blur = 20 })
+    glass.panel(win, x, y, w, h, { radius = 14, tint = C.popover, blur = 20 })
+    input.hit("account:backdrop", x, y, w, h, { cursor = false })
     win:text(x + 16, y + 16, "Accounts", { size = 12, font = fonts.semibold, color = C.textFaint, letterSpacing = 0.5 })
     local ry = y + 40
     if session.status == "signedOut" then
@@ -184,7 +257,7 @@ local function drawAccountMenu(L: table)
     for i, a in list do
         local st = input.hit(`account:{i}`, x + 6, ry, w - 12, 48)
         if st.hover then win:fillRect(x + 6, ry, w - 12, 48, C.hover, { radius = 8 }) end
-        win:circle(x + 32, ry + 24, 16, 0x2A2A30FF)
+        win:circle(x + 32, ry + 24, 16, tokens.wash(0x18))
         win:text(x + 32, ry + 15, string.upper(string.sub(a.name, 1, 1)), { size = 13, font = fonts.semibold, color = C.text, align = "center" })
         media.art(win, a.photo, x + 16, ry + 8, 32, 32, { round = true })
         win:text(x + 58, ry + 7, a.name, { size = 14, font = fonts.semibold, color = C.text, maxWidth = w - 100, overflow = "ellipsis" })
@@ -197,6 +270,8 @@ local function drawAccountMenu(L: table)
         end
         ry += 52
     end
+    local manage = widgets.pill(win, "account:manage", "Manage accounts…", x + 12, y + h - 42, { height = 30, size = 12.5, noBackground = true })
+    if manage.click then openSettings("youtube") end
     win:popOpacity()
 end
 
@@ -218,17 +293,33 @@ titlebar.start()
 -- FRAME --------------------------------------------------------------------
 
 local lastCursor = nil
+local pageLoads = 0
 
 local debugFrames = os.getenv("SHIRABE_DEBUG_FRAMES") ~= nil
+local lastWork = 0        -- seconds the previous frame's drawing took (debug output)
 local frameCount = 0
 local function frame(events: {table}, dt: number): boolean
     frameCount += 1
+    local started = os.clock()
+    -- SHIRABE_PROF=1: profile script functions from frame 30 to the exit.
+    if frameCount == 30 and os.getenv("SHIRABE_PROF") then require("@neyuki/profile").start() end
     if debugFrames and frameCount % 30 == 1 then
-        print(`frame {frameCount} t={string.format("%.1f", os.clock())} status={session.status} page={router.current()}`)
+        local st = bridge.state ?? {}
+        local us = ui.stats()
+        print(string.format("ms last frame: work %.1f (draw %.1f, blur %.1f), present %.1f", lastWork * 1000,
+            us.draw, us.blur, us.present))
+        print(`frame {frameCount} t={string.format("%.1f", os.clock())} status={session.status} page={router.current()} rate={st.rate} fxGraph={st.fxGraph} pos={st.position}`)
     end
     anim.begin(dt)
     input.begin(events)
     images.pump()
+    fx.update()
+    -- A (re)loaded page starts with neutral FX and its own volume.
+    if bridge.loads ~= pageLoads then
+        pageLoads = bridge.loads
+        fx.reapply()
+        if not os.getenv("SHIRABE_TEST_MUTE") then playback.setVolume(cfg.playback.volume) end
+    end
 
     for _, e in events do
         if e.kind == "webview" then
@@ -266,19 +357,49 @@ local function frame(events: {table}, dt: number): boolean
             break
         end
     end
-    if input.key("escape") then accountMenu = false end
+    if input.key("f11") then nowplaying.open = not nowplaying.open end
+    if input.key("l", true) then actions.like() end
+    if input.key("q", true) then queuepanel.open = not queuepanel.open end
+    if not widgets.focusedField() then
+        if input.key("arrowright", true) then playback.next() end
+        if input.key("arrowleft", true) then playback.prev() end
+        if input.key("arrowright", false) then playback.seek(math.min(player.duration, playback.now() + 5)) end
+        if input.key("arrowleft", false) then playback.seek(math.max(0, playback.now() - 5)) end
+    end
+    -- Escape closes the topmost thing (a focused text field handles its own).
+    if not widgets.focusedField() and input.key("escape") then
+        if menu.isOpen() then menu.close()
+        elseif popovers.which then popovers.which = nil
+        elseif settingsView.open then settingsView.open = false
+        elseif accountMenu then accountMenu = false
+        elseif nowplaying.open then nowplaying.open = false
+        elseif queuepanel.open then queuepanel.open = false end
+    end
 
     local w, h = win:size()
     local L = layout(w, h)
 
-    local animating = background.draw(win, w, h, dt, cfg.background)
+    local cover = player.track and images.get(player.track.thumbnails, 226) or nil
+    appearance.update(cfg.appearance, cover)
+    local animating = background.draw(win, w, h, dt, cfg.background, cover)
     local onEdge = titlebar.handleEdges(win, L)
-    router.draw(win, L.content, ctx)
-    drawBack(L)
+    -- The wheel over the now-playing view or the queue panel is theirs.
+    local npOpen = nowplaying.progress()
+    if npOpen > 0.5 or queuepanel.contains(L.content) or menu.isOpen() or settingsView.open then input.scrollTaken = true end
+    if npOpen < 0.999 then
+        router.draw(win, L.content, ctx)
+        drawBack(L)
+    end
+    local reserve = (queuepanel.open and nowplaying.open) and (queuepanel.WIDTH + 8) or 0
+    nowplaying.draw(win, L.content, ctx, anim.follow("np:reserve", reserve, 12, reserve))
+    queuepanel.draw(win, L.content, ctx)
     rail.draw(win, L.rail, router.current() ?? "home", navigate, accountInfo(),
-        function() accountMenu = not accountMenu end, openSettings)
+        function() accountMenu = not accountMenu end, function() openSettings() end)
     playerbar.draw(win, L.playerbar, player, actions)
+    popovers.draw(win, playerbar.anchors, L.playerbar)
     drawAccountMenu(L)
+    settingsView.draw(win)
+    menu.draw(win)
     drawToast(L)
     titlebar.draw(win, L, onEdge)
     if harness.showStats then harness.drawStats(win, L.content.x + 8, L.content.h - 30) end
@@ -292,6 +413,7 @@ local function frame(events: {table}, dt: number): boolean
     harness.after(win, dt, navigate)
     -- The close button (or a dev run) may have closed the window.
     if not win:isOpen() then return false end
+    lastWork = os.clock() - started
     win:present()
     return animating or anim.busy or harness.showStats or harness.active or images.busy() or loader.busy()
         or player.playing
@@ -318,5 +440,14 @@ while win:isOpen() do
     if not win:isOpen() then break end
     local tweens = ui.update(dt)
     busy = frame(events, dt) or tweens > 0 or #events > 0
+end
+if os.getenv("SHIRABE_PROF") then
+    local out = require("@neyuki/profile").stop()
+    local n = 0
+    for line in string.gmatch(out, "[^
+]+") do
+        n += 1
+        if n <= 50 then print(line) end
+    end
 end
 bridge.close()

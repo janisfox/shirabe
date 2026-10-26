@@ -1,0 +1,75 @@
+-- A context menu (right click on a track, album or playlist). `menu.show(items,
+-- x, y)` opens it at the pointer; `menu.draw(win)` is called once a frame,
+-- after everything it should cover. Items: { label, icon?, act = function }.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local menu = {}
+
+local current = nil   -- { items, x, y, opened }
+
+function menu.show(items: {table}, x: number, y: number)
+    if #items == 0 then return end
+    current = { items = items, x = x, y = y, opened = os.clock() }
+    anim.set("menu:open", 0)
+end
+
+function menu.isOpen(): boolean
+    return current ~= nil
+end
+
+function menu.close()
+    current = nil
+end
+
+local ROW = 34
+
+function menu.draw(win: any)
+    if not current then return end
+    local W, H = win:size()
+    local w = 220
+    for _, item in current.items do
+        w = math.max(w, ui.measureText(item.label, { size = 13, font = fonts.medium }) + 56)
+    end
+    local h = #current.items * ROW + 10
+    local x = math.min(current.x, W - w - 8)
+    local y = (current.y + h > H - 8) and math.max(8, current.y - h) or current.y
+    local p = anim.follow("menu:open", 1, 22, 0)
+    -- A press outside closes it (the press itself still goes to what is under it).
+    local inside = input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h
+    if (input.pressed or input.rightPressed) and not inside and os.clock() - current.opened > 0.05 then
+        current = nil
+        return
+    end
+    win:pushOpacity(p)
+    glass.panel(win, x, y + (1 - p) * -6, w, h, { radius = 10, tint = C.popover, blur = 16 })
+    local ry = y + 5 + (1 - p) * -6
+    local picked = nil
+    input.hit("menu:backdrop", x, y, w, h, { cursor = false })   -- before the items, which win over it
+    for i, item in current.items do
+        local st = input.hit(`menu:{i}`, x + 5, ry, w - 10, ROW)
+        if st.hover then win:fillRect(x + 5, ry, w - 10, ROW, C.hover, { radius = 7 }) end
+        local tx = x + 16
+        if item.icon then
+            icons.draw(win, item.icon, tx, ry + (ROW - 16) / 2, 16, C.textDim)
+            tx += 28
+        end
+        win:text(tx, ry + (ROW - 17) / 2, item.label, { size = 13, font = fonts.medium, color = C.text })
+        if st.click then picked = item end
+        ry += ROW
+    end
+    win:popOpacity()
+    if picked then
+        current = nil
+        picked.act()
+    end
+end
+
+return menu

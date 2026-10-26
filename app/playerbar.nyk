@@ -14,13 +14,17 @@ local media = require("kit/media")
 local C = tokens.color
 local playerbar = {}
 
+playerbar.anchors = {}   -- button id -> { x, y } (top center) for popovers
+
 local function clock(seconds: number): string
     local s = math.max(0, math.floor(seconds))
     return string.format("%d:%02d", s // 60, s % 60)
 end
 
 -- `player` is state/player; `actions` holds the callbacks (toggle, next, prev,
--- seek, like, shuffle, cycleRepeat, toggleLyrics, toggleQueue).
+-- seek, like, shuffle, cycleRepeat, toggleLyrics, toggleQueue, toggleFx,
+-- toggleVolume, openNowPlaying) and the state queries (lyricsOpen, queueOpen,
+-- fxOpen, fxActive, volumeOpen). Popovers anchor to `playerbar.anchors`.
 function playerbar.draw(win: any, R: table, player: table, actions: table)
     glass.panel(win, R.x, R.y, R.w, R.h, { radius = tokens.radius.panel, blur = 0 })
     local track = player.track
@@ -32,7 +36,7 @@ function playerbar.draw(win: any, R: table, player: table, actions: table)
     if track then
         media.art(win, track.thumbnails, cx, cy - cover / 2, cover, cover, { radius = 7, kind = "song" })
     else
-        win:fillRect(cx, cy - cover / 2, cover, cover, 0xFFFFFF12, { radius = 7 })
+        win:fillRect(cx, cy - cover / 2, cover, cover, tokens.wash(0x12), { radius = 7 })
         icons.draw(win, "lyrics", cx + 12, cy - 10, 20, C.textFaint)
     end
     local leftW = math.min(320, R.w * 0.3)
@@ -41,12 +45,15 @@ function playerbar.draw(win: any, R: table, player: table, actions: table)
     local title = (track and track.title) ?? "Nothing playing"
     local artist = (track and media.byline(track)) ?? "Pick something to listen to"
     if player.ad then artist = "Ad" end
+    -- The cover and title open the now-playing view.
+    local open = input.hit("bar:open", cx, cy - cover / 2, tx - cx + textW, cover)
+    if open.click and track and actions.openNowPlaying then actions.openNowPlaying() end
     win:text(tx, cy - 19, title, { size = 14, font = fonts.semibold, color = C.text, maxWidth = textW, overflow = "ellipsis" })
     win:text(tx, cy + 2, artist, { size = 12.5, font = fonts.regular, color = C.textDim, maxWidth = textW, overflow = "ellipsis" })
     if track then
         local liked = track.likeStatus == "LIKE"
         local like = widgets.iconButton(win, "bar:like", "heart", tx + textW + 6, cy - 15, 30,
-            { active = liked, iconSize = 17, color = liked and 0xF2F2F0FF or nil })
+            { active = liked, iconSize = 17, color = liked and C.text or nil })
         if like.click then actions.like() end
     end
 
@@ -61,26 +68,32 @@ function playerbar.draw(win: any, R: table, player: table, actions: table)
     local hv = anim.follow("bar:play:hover", (play.hover and 1 or 0), tokens.motion.hoverRate)
     local pr = anim.follow("bar:play:press", (play.held and 1 or 0), 30)
     local r = 19 * (1 + hv * 0.05 - pr * 0.07)
-    win:circle(mid, cy, r, enabled and C.text or 0xF2F2F040)
-    icons.draw(win, player.playing and "pause" or "play", mid - 9, cy - 9, 18, 0x111113FF)
+    win:circle(mid, cy, r, enabled and C.text or tokens.wash(0x40))
+    icons.draw(win, player.playing and "pause" or "play", mid - 9, cy - 9, 18, C.textOnActive)
     if play.click and enabled then actions.toggle() end
     if widgets.iconButton(win, "bar:next", "next", mid + 36, cy - 17, 34, { iconSize = 17, color = dim }).click and enabled then
         actions.next()
     end
 
-    -- Right: shuffle, repeat, lyrics, queue, volume.
+    -- Right: shuffle, repeat, lyrics, FX, queue, volume.
+    local function on(query) return query ~= nil and query() == true end
     local right = {
         { id = "bar:shuffle", icon = "shuffle", on = player.shuffle, act = actions.shuffle },
         { id = "bar:repeat", icon = "repeat", on = player["repeat"] ~= "off", act = actions.cycleRepeat },
-        { id = "bar:lyrics", icon = "lyrics", on = actions.lyricsOpen and actions.lyricsOpen(), act = actions.toggleLyrics },
-        { id = "bar:queue", icon = "queue", on = actions.queueOpen and actions.queueOpen(), act = actions.toggleQueue },
-        { id = "bar:volume", icon = "volume", on = false, act = nil },
+        { id = "bar:lyrics", icon = "lyrics", on = on(actions.lyricsOpen), act = actions.toggleLyrics },
+        { id = "bar:fx", icon = "sliders", on = on(actions.fxOpen) or on(actions.fxActive), act = actions.toggleFx },
+        { id = "bar:queue", icon = "queue", on = on(actions.queueOpen), act = actions.toggleQueue },
+        { id = "bar:volume", icon = "volume", on = on(actions.volumeOpen), act = actions.toggleVolume },
     }
     local x = R.x + R.w - 12 - #right * 34
     for _, b in right do
         local st = widgets.iconButton(win, b.id, b.icon, x, cy - 17, 34,
             { iconSize = 17, color = b.on and C.text or nil, active = b.on })
         if b.on then win:circle(x + 17, cy + 15, 1.6, C.text) end
+        if b.id == "bar:repeat" and player["repeat"] == "one" then
+            win:text(x + 24, cy - 13, "1", { size = 9, font = fonts.bold, color = C.text })
+        end
+        playerbar.anchors[b.id] = { x = x + 17, y = R.y }
         if st.click and b.act then b.act() end
         x += 34
     end
@@ -89,7 +102,8 @@ function playerbar.draw(win: any, R: table, player: table, actions: table)
     local px, pw = R.x + 14, R.w - 28
     local bar = input.hit("bar:progress", px, R.y - 4, pw, 10)
     local grow = anim.follow("bar:progress:hover", ((bar.hover or bar.held) and 1 or 0), 20)
-    local frac = (player.duration > 0) and math.clamp(player.position / player.duration, 0, 1) or 0
+    local position = actions.now and actions.now() or player.position
+    local frac = (player.duration > 0) and math.clamp(position / player.duration, 0, 1) or 0
     if bar.held and enabled and player.duration > 0 then
         frac = math.clamp((input.mx - px) / pw, 0, 1)
         if input.released or not input.down then actions.seek(frac * player.duration) end
@@ -98,8 +112,8 @@ function playerbar.draw(win: any, R: table, player: table, actions: table)
         actions.seek(math.clamp((input.mx - px) / pw, 0, 1) * player.duration)
     end
     local th = 2 + grow * 2
-    win:fillRect(px, R.y + 1, pw, th, 0xFFFFFF1A, { radius = th / 2 })
-    if frac > 0 then win:fillRect(px, R.y + 1, pw * frac, th, C.text, { radius = th / 2 }) end
+    win:fillRect(px, R.y + 1, pw, th, tokens.wash(0x1A), { radius = th / 2 })
+    if frac > 0 then win:fillRect(px, R.y + 1, pw * frac, th, C.accent, { radius = th / 2 }) end
     if grow > 0.05 and enabled then
         win:circle(px + pw * frac, R.y + 1 + th / 2, 5 * grow, C.text)
         win:text(px, R.y - 18, clock(frac * player.duration), { size = 11, font = fonts.medium, color = C.textDim, opacity = grow })

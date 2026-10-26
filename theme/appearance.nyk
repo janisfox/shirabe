@@ -1,0 +1,131 @@
+-- Appearance settings applied to the design tokens: text tone (palette), glass
+-- opacity, panel corner radius and the accent color, which is either fixed or
+-- follows the cover art (its most vivid color, lifted or darkened until it
+-- reads against the tone) and glides to each new cover.
+
+local ui = require("@neyuki/ui")
+local tokens = require("theme/tokens")
+local anim = require("kit/anim")
+
+local appearance = {}
+
+local C = tokens.color
+local target = C.accent          -- where the accent is gliding to
+local sampledFrom = nil          -- the cover image the target came from
+local applied = nil              -- settings key last applied
+
+local function channels(c: number): (number, number, number)
+    return (c // 0x1000000) % 256, (c // 0x10000) % 256, (c // 0x100) % 256
+end
+
+local function pack(r: number, g: number, b: number): number
+    return math.floor(r) * 0x1000000 + math.floor(g) * 0x10000 + math.floor(b) * 0x100 + 0xFF
+end
+
+local function luminance(r: number, g: number, b: number): number
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+end
+
+-- "#rrggbb" -> packed color, or nil.
+function appearance.parseHex(hex: string?): number?
+    if type(hex) ~= "string" then return nil end
+    local digits = string.match(hex, "^#?(%x%x%x%x%x%x)$")
+    if not digits then return nil end
+    return tonumber(digits, 16) * 0x100 + 0xFF
+end
+
+function appearance.hex(c: number): string
+    local r, g, b = channels(c)
+    return string.format("#%02x%02x%02x", r, g, b)
+end
+
+-- Scales a color's brightness until it contrasts with the tone's background:
+-- bright on the dark tone, deep on the light one.
+local function readable(c: number): number
+    local r, g, b = channels(c)
+    local l = luminance(r, g, b)
+    if tokens.light then
+        if l > 0.42 then
+            local k = 0.42 / l
+            r, g, b = r * k, g * k, b * k
+        end
+    elseif l < 0.55 then
+        -- Mix toward white rather than scaling (black would stay black).
+        local t = math.clamp((0.55 - l) / (1 - l + 0.001), 0, 1)
+        r, g, b = r + (255 - r) * t, g + (255 - g) * t, b + (255 - b) * t
+    end
+    return pack(r, g, b)
+end
+
+-- The most vivid color of an image: drawn into a 12 x 12 canvas and read back.
+local function vivid(image: any): number?
+    local c = ui.canvas(12, 12)
+    c:drawImage(image, 0, 0, { width = 12, height = 12, fit = "cover" })
+    local best, bestScore = nil, -1
+    local sr, sg, sb, n = 0, 0, 0, 0
+    for y = 0, 11 do
+        for x = 0, 11 do
+            local r, g, b = c:getPixel(x + 0.5, y + 0.5)
+            local hi, lo = math.max(r, g, b), math.min(r, g, b)
+            local sat = (hi > 0) and (hi - lo) / hi or 0
+            local score = sat * (hi / 255) * ((hi > 40) and 1 or 0.2)
+            if score > bestScore then best, bestScore = pack(r, g, b), score end
+            sr += r
+            sg += g
+            sb += b
+            n += 1
+        end
+    end
+    c:close()
+    -- A grey cover has no vivid color worth using: take its average tone.
+    if bestScore < 0.12 then return pack(sr / n, sg / n, sb / n) end
+    return best
+end
+
+-- Applies tone, glass and radius (cheap; called when settings change).
+function appearance.apply(cfg: table)
+    local key = `{cfg.tone}|{cfg.glass}|{cfg.radius}|{cfg.accent}`
+    if key == applied then return end
+    applied = key
+    tokens.light = cfg.tone == "light"
+    local palette = tokens.palettes[tokens.light and "light" or "dark"]
+    for k, v in pairs(palette) do C[k] = v end
+    local glass = math.clamp(cfg.glass ?? 0.88, 0.3, 1)
+    C.panel = palette.panel - (palette.panel % 256) + math.floor(255 * glass)
+    C.popover = palette.popover - (palette.popover % 256) + math.floor(255 * math.min(1, glass + 0.07))
+    tokens.radius.panel = math.clamp(cfg.radius ?? 14, 0, 24)
+    tokens.radius.card = math.clamp(math.round((cfg.radius ?? 14) * 0.72), 0, 18)
+    local fixed = appearance.parseHex(cfg.accent)
+    if fixed then
+        target = readable(fixed)
+        sampledFrom = nil
+    elseif cfg.accent == "cover" then
+        sampledFrom = nil   -- sample again for the new tone
+    end
+end
+
+-- Once a frame: follows the cover (when the accent does) and glides the
+-- accent toward its target. `cover` is the playing track's artwork or nil.
+function appearance.update(cfg: table, cover: any?)
+    appearance.apply(cfg)
+    if cfg.accent == "cover" then
+        if cover and cover ~= sampledFrom then
+            sampledFrom = cover
+            local c = vivid(cover)
+            if c then target = readable(c) end
+        elseif not cover and sampledFrom == nil then
+            target = tokens.light and 0x17171AFF or 0xF2F2F0FF
+        end
+    end
+    if C.accent ~= target then
+        local t = 1 - math.exp(-5 * anim.dt)
+        local stepped = ui.mixColor(C.accent, target, t)
+        if stepped == C.accent then stepped = target end
+        C.accent = stepped
+        anim.busy = true
+    end
+    local r, g, b = channels(C.accent)
+    C.textOnAccent = (luminance(r, g, b) > 0.55) and 0x111113FF or 0xF8F8F6FF
+end
+
+return appearance

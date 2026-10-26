@@ -55,6 +55,23 @@ function playback.prev() bridge.send("prev") end
 function playback.seek(seconds: number)
     bridge.send("seek", { seconds = seconds })
     player.position = seconds
+    player.positionAt = os.clock()
+end
+
+-- The position right now: the page reports it about 4 times a second, so it
+-- is carried forward from the last report while playing (lyrics need better).
+function playback.now(): number
+    local p = player.position
+    if player.playing and not player.buffering and player.positionAt then
+        p += math.min(1, os.clock() - player.positionAt) * (player.speed ?? 1)
+    end
+    return p
+end
+
+-- volume: 0..1
+function playback.setVolume(volume: number)
+    player.volume = math.clamp(volume, 0, 1)
+    bridge.send("volume", { value = math.round(player.volume * 100) })
 end
 
 -- The page's state messages (about 4 a second while playing).
@@ -63,6 +80,8 @@ function playback.onState(s: table)
     player.playing = s.playing == true or s.buffering == true
     player.buffering = s.buffering == true
     player.position = s.position ?? player.position
+    player.positionAt = os.clock()
+    if type(s.volume) == "number" then player.volume = s.volume / 100 end
     if (s.duration ?? 0) > 0 then player.duration = s.duration end
     player.ad = s.ad == true
     if not s.videoId then return end

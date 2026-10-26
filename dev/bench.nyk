@@ -1,0 +1,36 @@
+-- Development aid: times the drawing calls the shell relies on, to tell
+-- whether a slow frame is Shirabe's doing or Neyuki's.
+--   neyuki dev/bench.nyk
+
+local ui = require("@neyuki/ui")
+local fonts = require("theme/fonts")
+local icons = require("theme/icons")
+fonts.load()
+local win = ui.open({ title = "bench", width = 1280, height = 800 })
+ui.poll(0.1)
+local function bench(name, n, f)
+    local t = os.clock()
+    for i = 1, n do f(i) end
+    print(string.format("%-28s %8.3f ms each", name, (os.clock() - t) * 1000 / n))
+end
+local bg = ui.canvas(1280, 800, { scale = win:scale() })
+bg:clear("#202030")
+local small = ui.canvas(24, 24, { scale = win:scale() })
+small:fillRect(0, 0, 24, 24, "#ff0000")
+local img = ui.loadImage("assets/logos/shirabe-icon-dark.png")
+bench("clear", 50, function() win:clear("#101010") end)
+bench("drawImage full canvas", 50, function() win:drawImage(bg, 0, 0) end)
+bench("drawImage 24px canvas", 2000, function(i) win:drawImage(small, (i % 50) * 20, 100) end)
+bench("drawImage img 40 radius", 500, function(i) win:drawImage(img, (i % 30) * 40, 200, { width = 40, height = 40, radius = 5 }) end)
+bench("drawImage img 40", 500, function(i) win:drawImage(img, (i % 30) * 40, 260, { width = 40, height = 40 }) end)
+bench("fillRect small radius", 2000, function(i) win:fillRect((i % 50) * 20, 300, 18, 18, 0xFFFFFF22, { radius = 4 }) end)
+bench("fillRect small", 2000, function(i) win:fillRect((i % 50) * 20, 330, 18, 18, 0xFFFFFF22) end)
+bench("fillRect full", 50, function(i) win:fillRect(0, 0, 1280, 800, 0x00000022) end)
+bench("text 30 chars", 1000, function(i) win:text(10, 400, "Some Title Of A Song Here 123", { size = 14, font = fonts.medium, color = 0xFFFFFFFF }) end)
+bench("text ellipsis", 1000, function(i) win:text(10, 430, "Some Title Of A Song Here 123 long long long", { size = 14, font = fonts.medium, color = 0xFFFFFFFF, maxWidth = 120, overflow = "ellipsis" }) end)
+bench("icons.draw cached", 2000, function(i) icons.draw(win, "heart", (i % 50) * 20, 500, 17, 0xFFFFFFA6) end)
+bench("blurRegion 300x66", 50, function(i) win:blurRegion(100, 600, 1000, 66, 24, { radius = 14 }) end)
+bench("circle", 2000, function(i) win:circle((i % 50) * 20, 700, 15, 0xFFFFFF22) end)
+bench("ui.mixColor", 5000, function(i) ui.mixColor(0xFFFFFF00, 0xFFFFFF14, 0.5) end)
+bench("present", 20, function() win:present() end)
+win:close()

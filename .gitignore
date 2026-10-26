@@ -5,3 +5,4 @@ tests/fixtures/ytm/*
 # Development snapshots and scratch output.
 *.ppm
 snap/
+dist/

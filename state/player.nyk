@@ -1,0 +1,14 @@
+-- What is playing. Milestone 2 only has the shape; milestone 3 fills it from
+-- the YouTube Music bridge (`state` events) and sends the controls back.
+
+return {
+    track = nil,        -- { videoId, title, artist, album, cover (Image?) }
+    playing = false,
+    buffering = false,
+    position = 0,       -- seconds
+    duration = 0,
+    liked = false,
+    volume = 1,
+    shuffle = false,
+    ["repeat"] = "off", -- "off" | "all" | "one"
+}

@@ -1,0 +1,203 @@
+-- Page parsers against recorded responses (tests/fixtures/ytm, captured with
+-- dev/capture.nyk). The fixtures hold a real account's library, so they are
+-- not shared; without them these tests are skipped.
+
+local fs = require("@neyuki/fs")
+local check = require("tests/check")
+local pages = require("services/ytm/parse/pages")
+
+local ROOT = "tests/fixtures/ytm"
+
+local function fixture(name: string): table?
+    local path = fs.join(ROOT, name .. ".json")
+    if not fs.exists(path) then return nil end
+    return json.decode(fs.read(path))
+end
+
+local function names(list: {table}?): string
+    local out = {}
+    for _, a in list ?? {} do table.insert(out, a.name) end
+    return table.concat(out, ", ")
+end
+
+local function count(items: {table}, kind: string): number
+    local n = 0
+    for _, item in items do
+        if item.kind == kind then n += 1 end
+    end
+    return n
+end
+
+if not fixture("home") then
+    check.skip("page parsers", `no fixtures in {ROOT} (run dev/capture.nyk)`)
+    return check
+end
+
+-- Owner account (English UI) ---------------------------------------------------
+
+check.case("home: shelves, items and continuation", function()
+    local home = pages.home(fixture("home"))
+    check.eq(#home.shelves, 3, "shelves")
+    check.eq(home.shelves[1].title, "Quick picks")
+    check.ok(home.continuation, "continuation")
+    for _, shelf in home.shelves do
+        check.ok(#shelf.items > 0, `items in {shelf.title}`)
+        for _, item in shelf.items do
+            check.ok(item.kind, `kind of {item.title}`)
+            check.ok(item.videoId or item.browseId or item.playlistId, `id of {item.title}`)
+            check.ok(#item.thumbnails > 0, `thumbnails of {item.title}`)
+        end
+    end
+end)
+
+check.case("search with a selected filter: songs with albums and durations", function()
+    local res = pages.search(fixture("search_songs"))
+    check.eq(#res.sections, 1, "sections")
+    local songs = res.sections[1]
+    check.eq(songs.title, "Songs")
+    check.eq(#songs.items, 20, "items")
+    check.ok(songs.continuation, "continuation")
+    local selected = nil
+    for _, f in res.filters do
+        if f.selected then selected = f.label end
+    end
+    check.eq(selected, "Songs", "selected filter")
+    for _, item in songs.items do
+        check.eq(item.kind, "song", `kind of {item.title}`)
+        check.ok(item.duration and item.duration > 0, `duration of {item.title}`)
+        check.ok(#item.artists > 0, `artists of {item.title}`)
+        check.ok(item.album, `album of {item.title}`)
+    end
+end)
+
+check.case("artist: header, top songs and carousels", function()
+    local a = pages.artist(fixture("artist"))
+    check.eq(a.name, "Queen")
+    check.eq(a.channelId, "UCiMhD4jzUqG-IgPzUmmytRQ")
+    check.ok(a.subscribers, "subscribers")
+    check.ok(a.play and a.radio, "play / radio endpoints")
+    check.ok(a.about and #a.about > 100, "about")
+    check.eq(a.shelves[1].title, "Top songs")
+    check.eq(a.shelves[1].layout, "list")
+    check.eq(a.shelves[1].items[1].title, "Bohemian Rhapsody")
+    check.ok(a.shelves[1].more, "top songs link to more")
+    local albums = a.shelves[2]
+    check.eq(albums.title, "Albums")
+    check.eq(count(albums.items, "album"), #albums.items, "all albums")
+    check.eq(names(albums.items[1].artists), "Queen", "albums inherit the artist")
+end)
+
+check.case("album: header and tracks inherit artist and album", function()
+    local album = pages.collection(fixture("album"), "album")
+    check.eq(album.title, "Hungarian Rhapsody (Live In Budapest / 1986)")
+    check.eq(names(album.artists), "Queen")
+    check.eq(album.year, 2012)
+    check.eq(#album.tracks, 27, "tracks")
+    check.ok(album.playlistId and string.sub(album.playlistId, 1, 7) == "OLAK5uy", "playlist id")
+    for i, track in album.tracks do
+        check.eq(names(track.artists), "Queen", `artist of track {i}`)
+        check.eq(track.album.name, album.title, `album of track {i}`)
+        check.ok(track.duration, `duration of track {i}`)
+    end
+end)
+
+check.case("accounts: owner and brand accounts", function()
+    local accounts = pages.accounts(fixture("accounts"))
+    check.eq(#accounts, 3)
+    check.eq(accounts[1].pageId, nil, "owner has no page id")
+    check.ok(accounts[1].selected, "owner selected")
+    check.eq(accounts[2].pageId, "102732312048878620219")
+    for _, a in accounts do check.ok(a.signinUrl and string.find(a.signinUrl, "action_handle_signin", 1, true), `signin url of {a.handle}`) end
+end)
+
+check.case("empty library pages parse to nothing", function()
+    check.eq(#pages.library(fixture("library_albums")).items, 0)
+    check.eq(#pages.library(fixture("library_artists")).items, 0)
+    check.eq(#pages.collection(fixture("liked_songs"), "playlist").tracks, 0)
+end)
+
+-- Brand account (German UI: nothing may depend on display text) ------------------
+
+local function brand(name: string): table?
+    return fixture("brand/" .. name)
+end
+
+if not brand("home") then
+    check.skip("brand account pages", "no fixtures in tests/fixtures/ytm/brand")
+    return check
+end
+
+check.case("brand home: localized shelf titles", function()
+    local home = pages.home(brand("home"))
+    check.eq(home.shelves[1].title, "Noch mal anhören")
+    check.eq(home.shelves[1].strapline, "JANIS")
+    check.ok(#home.moods > 0, "mood chips")
+end)
+
+check.case("brand search: top result, type labels dropped, kinds by endpoint", function()
+    local res = pages.search(brand("search"))
+    check.ok(res.top, "top result")
+    check.eq(names(res.top.artists), "Queen")
+    check.eq(#res.top.related, 3, "related")
+    local items = res.sections[1].items
+    check.eq(items[1].kind, "song")
+    check.eq(items[1].title, "Bohemian Rhapsody")
+    check.eq(names(items[1].artists), "Queen")
+    for _, item in items do
+        for _, extra in item.extras do
+            check.ok(extra ~= "Titel" and extra ~= "Single" and extra ~= "Künstler", `type label kept in {item.title}`)
+        end
+    end
+    check.ok(count(items, "artist") >= 1 and count(items, "album") >= 1 and count(items, "playlist") >= 1, "mixed kinds")
+end)
+
+check.case("brand album: tracks numbered in order", function()
+    local album = pages.collection(brand("album"), "album")
+    check.eq(album.title, "A Night At The Opera")
+    check.eq(album.year, 1975)
+    check.eq(#album.tracks, 12)
+    for i, track in album.tracks do check.eq(track.index, i, `index of {track.title}`) end
+    check.ok(#album.related > 0, "related shelves")
+end)
+
+check.case("brand playlist: owner, per-track albums, set video ids", function()
+    local list = pages.collection(brand("playlist"), "playlist")
+    check.eq(list.title, "idk school or sum")
+    check.eq(list.owner and list.owner.name, "janis", "owner")
+    check.eq(#list.tracks, 16)
+    for _, track in list.tracks do
+        check.ok(track.setVideoId, `setVideoId of {track.title}`)
+        check.ok(track.album, `album of {track.title}`)
+    end
+end)
+
+check.case("brand liked songs: first page and continuation", function()
+    local liked = pages.collection(brand("liked_songs"), "playlist")
+    check.eq(liked.playlistId, "LM")
+    check.eq(#liked.tracks, 100)
+    check.ok(liked.continuation, "continuation")
+end)
+
+check.case("brand library: playlists skip the create tile, artists map to channels", function()
+    local playlists = pages.library(brand("library_playlists"))
+    check.eq(playlists.items[1].browseId, "VLLM", "Liked Music first")
+    check.eq(count(playlists.items, "playlist"), #playlists.items, "only playlists")
+    local artists = pages.library(brand("library_artists"))
+    check.eq(#artists.items, 25)
+    check.eq(artists.items[1].title, "Toby Fox")
+    check.eq(artists.items[1].artistId, "UCntaczLM_lWH85oZp6rRX1w")
+    check.ok(artists.continuation, "continuation")
+end)
+
+check.case("brand watch and lyrics: tabs found by page type", function()
+    local w = pages.watch(brand("next"))
+    check.eq(w.lyrics, "MPLYt_wUbiMNbaE6O")
+    check.eq(w.related, "MPTRt_wUbiMNbaE6O")
+    check.eq(#w.queue, 1)
+    check.eq(w.current, 1)
+    local lyrics = pages.lyrics(brand("lyrics"))
+    check.ok(lyrics and string.find(lyrics.text, "Is this the real life", 1, true), "lyrics text")
+    check.eq(pages.lyrics({ contents = { messageRenderer = { text = { runs = { { text = "No lyrics" } } } } } }), nil)
+end)
+
+return check

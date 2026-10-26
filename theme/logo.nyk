@@ -1,0 +1,41 @@
+-- The shirabe mark, drawn from the pixel grid in its SVG (a set of squares), so
+-- it is sharp at any size and each pixel can be animated on its own.
+
+local fs = require("@neyuki/fs")
+
+local logo = {}
+
+local cells = {}   -- { x, y, w, h } in SVG units
+local extent = 34  -- the SVG's viewBox size
+
+function logo.load(path: string)
+    local svg = fs.read(path)
+    local box = string.match(svg, 'viewBox="0 0 ([%d%.]+)')
+    extent = tonumber(box) ?? extent
+    cells = {}
+    for attrs in string.gmatch(svg, "<rect([^>]*)/?>") do
+        local function attr(name) return tonumber(string.match(attrs, name .. '="([%d%.]+)"')) end
+        table.insert(cells, { x = attr("x") ?? 0, y = attr("y") ?? 0, w = attr("width") ?? 1, h = attr("height") ?? 1 })
+    end
+end
+
+-- Draws the mark in a `size` x `size` box. `progress` (0..1, default 1) plays
+-- the intro: pixels pop in from the left with a short stagger.
+function logo.draw(target: any, x: number, y: number, size: number, color: any, progress: number?)
+    local p = progress ?? 1
+    local s = size / extent
+    for _, cell in cells do
+        local local_t = math.clamp((p * 1.6) - (cell.x / extent) * 0.6, 0, 1)
+        if local_t > 0 then
+            local eased = 1 - (1 - local_t) ^ 3
+            local inset = (1 - eased) * cell.w * 0.5
+            target:fillRect(
+                x + (cell.x + inset) * s, y + (cell.y + inset) * s,
+                (cell.w - inset * 2) * s, (cell.h - inset * 2) * s,
+                color, { radius = 0.6 * s * eased }
+            )
+        end
+    end
+end
+
+return logo

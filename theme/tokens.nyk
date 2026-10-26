@@ -1,0 +1,46 @@
+-- Design tokens: every size, color and timing the shell uses.
+
+local tokens = {}
+
+tokens.size = {
+    titlebar = 52,      -- draggable strip at the top (logo + window buttons live in it)
+    rail = 58,          -- width of the navigation rail
+    gutter = 6,         -- space between the window edge and the floating panels
+    playerbar = 66,
+    caption = 46,       -- width of a window button
+    edge = 6,           -- resize border of the frameless window
+    content = 24,       -- inner padding of pages
+}
+
+tokens.radius = {
+    panel = 14,
+    card = 10,
+    chip = 8,
+    button = 8,
+}
+
+tokens.color = {
+    text = 0xF2F2F0FF,
+    textDim = 0xF2F2F0A6,
+    textFaint = 0xF2F2F066,
+    panel = 0x0A0A0BE0,         -- rail / player bar: near-black glass
+    panelBorder = 0xFFFFFF14,
+    surface = 0xFFFFFF14,       -- chips, inputs, idle buttons on the wallpaper
+    surfaceHover = 0xFFFFFF24,
+    surfaceActive = 0xF2F2F0FF, -- the selected chip (light pill, dark text)
+    textOnActive = 0x111113FF,
+    hover = 0xFFFFFF14,
+    danger = 0xE5484DFF,
+    skeleton = 0xFFFFFF10,
+    shade = 0x00000059,         -- dims the wallpaper behind content
+}
+
+tokens.motion = {
+    page = 0.22,        -- page cross-fade
+    pageShift = 10,     -- pixels a page slides while fading in
+    hoverRate = 18,     -- how fast hover highlights follow the pointer (1/s)
+    pillRate = 14,      -- selection pills sliding between options
+    scrollFriction = 9, -- momentum scrolling decay (1/s)
+}
+
+return tokens

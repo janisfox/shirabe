@@ -1,0 +1,115 @@
+-- Development aid: runs every parser over a fixture folder and prints a
+-- summary, to eyeball parser output.  neyuki dev/parse_dump.nyk [folder]
+
+local fs = require("@neyuki/fs")
+local io = require("@neyuki/io")
+local pages = require("services/ytm/parse/pages")
+
+local dir = os.args()[1] ?? "tests/fixtures/ytm"
+
+local function load(name: string): table?
+    local path = fs.join(dir, name .. ".json")
+    if not fs.exists(path) then return nil end
+    return json.decode(fs.read(path))
+end
+
+local function artists(item: table): string
+    local names = {}
+    for _, a in item.artists ?? {} do table.insert(names, a.name) end
+    return table.concat(names, ", ")
+end
+
+local function line(item: table): string
+    local id = item.videoId ?? item.browseId ?? item.playlistId ?? "-"
+    return string.format("    %-8s %-36s | %-24s | %s%s%s", item.kind ?? "?",
+        string.sub(item.title, 1, 36), string.sub(artists(item), 1, 24),
+        item.album and ("album=" .. string.sub(item.album.name, 1, 18) .. " ") or "",
+        item.durationText and (item.durationText .. " ") or "", id)
+end
+
+local function show(items: {table}, limit: number?)
+    for i, item in items do
+        if i > (limit ?? 4) then
+            print(`    … {#items - (limit ?? 4)} more`)
+            break
+        end
+        print(line(item))
+    end
+end
+
+local r = load("home")
+if r then
+    local home = pages.home(r)
+    print(`HOME: {#home.shelves} shelves, continuation={home.continuation ~= nil}, moods={#home.moods}`)
+    for _, s in home.shelves do
+        print(`  [{s.layout}] {s.title} ({#s.items}){s.strapline and (" / " .. s.strapline) or ""} more={s.more ~= nil}`)
+        show(s.items, 3)
+    end
+end
+
+for _, name in { "search", "search_songs" } do
+    r = load(name)
+    if r then
+        local res = pages.search(r)
+        print(`{string.upper(name)}: filters={#res.filters} sections={#res.sections}`)
+        for _, f in res.filters do io.write(`  [{f.label}{f.selected and "*" or ""}]`) end
+        print()
+        if res.top then
+            print(`  TOP {res.top.kind} {res.top.title} | {artists(res.top)} related={#res.top.related}`)
+            show(res.top.related, 3)
+        end
+        for _, s in res.sections do
+            print(`  section "{s.title}" ({#s.items}) cont={s.continuation ~= nil}`)
+            show(s.items, 8)
+        end
+    end
+end
+
+for _, spec in { { "album", "album" }, { "playlist", "playlist" }, { "liked_songs", "playlist" } } do
+    r = load(spec[1])
+    if r then
+        local c = pages.collection(r, spec[2])
+        print(`{string.upper(spec[1])}: {c.title} | {c.subtitle} | {c.secondSubtitle} | by {artists(c)} year={c.year} playlistId={c.playlistId}`)
+        print(`  tracks={#c.tracks} continuation={c.continuation ~= nil} related={#c.related} thumbs={#c.thumbnails} desc={c.description and #c.description or 0}`)
+        show(c.tracks, 5)
+    end
+end
+
+r = load("artist")
+if r then
+    local a = pages.artist(r)
+    print(`ARTIST: {a.name} subs={a.subscribers} monthly={a.monthly} channel={a.channelId} play={a.play ~= nil} radio={a.radio ~= nil} about={a.about and #a.about or 0}`)
+    for _, s in a.shelves do
+        print(`  [{s.layout}] {s.title} ({#s.items}) more={s.more ~= nil}`)
+        show(s.items, 2)
+    end
+end
+
+for _, name in { "library_playlists", "library_albums", "library_artists" } do
+    r = load(name)
+    if r then
+        local lib = pages.library(r)
+        print(`{string.upper(name)}: {#lib.items} items, continuation={lib.continuation ~= nil}`)
+        show(lib.items, 4)
+    end
+end
+
+r = load("next")
+if r then
+    local w = pages.watch(r)
+    print(`WATCH: queue={#w.queue} current={w.current} lyrics={w.lyrics} related={w.related} playlist={w.playlistId}`)
+    show(w.queue, 3)
+end
+
+r = load("lyrics")
+if r then
+    local l = pages.lyrics(r)
+    print(`LYRICS: {l and (#l.text .. " chars, source " .. tostring(l.source)) or "none"}`)
+end
+
+r = load("accounts")
+if r then
+    for _, a in pages.accounts(r) do
+        print(`ACCOUNT {a.selected and "*" or " "} {a.name} {a.handle ?? ""} pageId={a.pageId ?? "owner"} signin={a.signinUrl ~= nil}`)
+    end
+end

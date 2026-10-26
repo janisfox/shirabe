@@ -1,0 +1,116 @@
+-- Development aid: records real YouTube Music responses as parser fixtures in
+-- tests/fixtures/ytm/. Read-only requests only (browse, search, next,
+-- accounts); nothing is played, liked or edited. Uses the signed-in profile.
+--   neyuki dev/capture.nyk [search query] [output folder]
+
+local ui = require("@neyuki/ui")
+local fs = require("@neyuki/fs")
+local bridge = require("services/ytm/bridge")
+
+local query = os.args()[1] ?? "rusino"
+local OUT = os.args()[2] ?? "tests/fixtures/ytm"
+
+-- Every value under `key` anywhere in a decoded response.
+local function collect(node: any, key: string, out: table?): table
+    out = out ?? {}
+    if type(node) == "table" then
+        for k, v in pairs(node) do
+            if k == key then table.insert(out, v) end
+            collect(v, key, out)
+        end
+    end
+    return out
+end
+
+local function first(node: any, key: string, test: (any) -> boolean): any
+    for _, v in collect(node, key) do
+        if test(v) then return v end
+    end
+    return nil
+end
+
+local function prefix(p: string): (any) -> boolean
+    return function(v) return type(v) == "string" and string.sub(v, 1, #p) == p end
+end
+
+local function save(name: string, endpoint: string, body: table): table
+    local text = bridge.apiText(endpoint, body)
+    local decoded = json.decode(text)
+    fs.write(fs.join(OUT, name .. ".json"), json.encode(decoded, { indent = 1 }))
+    print(string.format("  %-22s %7d bytes  (%s)", name, #text, endpoint))
+    return decoded
+end
+
+local function run()
+    fs.mkdir(OUT, true)
+    local id = bridge.waitReady(0, 40)
+    if not id then error("page never became ready") end
+    if not id.signedIn then error("not signed in: sign in through the app (or spike/m1.nyk signin) first") end
+    print(`signed in, pageId={id.pageId ?? "owner"}`)
+
+    save("accounts", "account/accounts_list", {
+        accountReadMask = { returnOwner = true, returnBrandAccounts = true, returnPersonaAccounts = false },
+        callCircumstance = "SWITCHING_USERS_FULL",
+    })
+    save("home", "browse", { browseId = "FEmusic_home" })
+
+    local search = save("search", "search", { query = query })
+    -- Filter chips carry the params for filtered searches.
+    local songsParams = nil
+    for _, chip in collect(search, "chipCloudChipRenderer") do
+        local label = chip.text and chip.text.runs and chip.text.runs[1] and chip.text.runs[1].text
+        local params = chip.navigationEndpoint and chip.navigationEndpoint.searchEndpoint and chip.navigationEndpoint.searchEndpoint.params
+        if label == "Songs" and params then songsParams = params end
+    end
+    if songsParams then
+        save("search_songs", "search", { query = query, params = songsParams })
+    else
+        print("  (no Songs chip found; skipped search_songs)")
+    end
+
+    local album = first(search, "browseId", prefix("MPREb"))
+    if album then save("album", "browse", { browseId = album }) end
+    -- An artist page (not a user channel, which also has a UC id).
+    local artistEndpoint = first(search, "browseEndpoint", function(e)
+        local config = e.browseEndpointContextSupportedConfigs
+        local pageType = config and config.browseEndpointContextMusicConfig and config.browseEndpointContextMusicConfig.pageType
+        return pageType == "MUSIC_PAGE_TYPE_ARTIST"
+    end)
+    if artistEndpoint then save("artist", "browse", { browseId = artistEndpoint.browseId }) end
+
+    save("library_playlists", "browse", { browseId = "FEmusic_liked_playlists" })
+    local libraryPlaylists = json.decode(fs.read(fs.join(OUT, "library_playlists.json")))
+    local playlist = first(libraryPlaylists, "browseId", function(v)
+        return type(v) == "string" and string.sub(v, 1, 2) == "VL" and v ~= "VLLM" and v ~= "VLSE"
+    end)
+    if playlist then save("playlist", "browse", { browseId = playlist }) end
+    save("library_albums", "browse", { browseId = "FEmusic_liked_albums" })
+    save("library_artists", "browse", { browseId = "FEmusic_library_corpus_track_artists" })
+    save("liked_songs", "browse", { browseId = "VLLM" })
+
+    local videoId = first(search, "videoId", function(v) return type(v) == "string" and #v == 11 end)
+    if videoId then
+        local nextResponse = save("next", "next", { videoId = videoId, isAudioOnly = true })
+        local lyrics = first(nextResponse, "browseId", prefix("MPLYt"))
+        if lyrics then
+            save("lyrics", "browse", { browseId = lyrics })
+        else
+            print("  (no lyrics tab for this track)")
+        end
+    end
+    print("done")
+end
+
+bridge.open({ visible = false, mute = true })
+-- No pcall/xpcall around run: inside one, task.wait blocks instead of
+-- yielding and the loop below would never pump the page. A failing task
+-- prints its error itself.
+local flow = task.spawn(run)
+
+-- A minimal loop: pump the page and the task scheduler until the task ends.
+while bridge.isOpen() do
+    for _, event in ui.poll(0.05) do
+        if event.kind == "webview" then bridge.handle(event) end
+    end
+    if coroutine.status(flow) == "dead" then bridge.close() end
+end

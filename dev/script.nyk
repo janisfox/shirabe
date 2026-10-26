@@ -1,0 +1,85 @@
+-- Development aid: replays a small input script as synthetic events, so UI
+-- flows can be exercised and captured without touching the real mouse or
+-- keyboard. One command per line ("#" starts a comment):
+--   wait <seconds>            move <x> <y>           click <x> <y>
+--   dbl <x> <y>               scroll <x> <y> <dy>    type <text...>
+--   key <name> [ctrl]         snap <name>            quit
+
+local fs = require("@neyuki/fs")
+local utf8 = require("@neyuki/utf8")
+
+local script = {}
+
+local steps = {}
+local index = 1
+local delay = 0
+local pending = {}   -- events queued for the next frames (one batch per frame)
+
+function script.load(path: string)
+    steps = {}
+    for line in fs.lines(path) do
+        local trimmed = string.match(line, "^%s*(.-)%s*$")
+        if trimmed ~= "" and string.sub(trimmed, 1, 1) ~= "#" then
+            local command, rest = string.match(trimmed, "^(%S+)%s*(.*)$")
+            table.insert(steps, { command = command, rest = rest })
+        end
+    end
+    index, delay, pending = 1, 0, {}
+end
+
+function script.active(): boolean
+    return index <= #steps or #pending > 0
+end
+
+local function numbers(rest: string): {number}
+    local out = {}
+    for n in string.gmatch(rest, "-?[%d%.]+") do table.insert(out, tonumber(n)) end
+    return out
+end
+
+-- Events for this frame. `onSnap(name)` captures; `onQuit()` ends the run.
+function script.step(dt: number, onSnap: (string) -> any, onQuit: () -> any): {table}
+    if #pending > 0 then return table.remove(pending, 1) end
+    if delay > 0 then
+        delay -= dt
+        return {}
+    end
+    local step = steps[index]
+    if not step then return {} end
+    index += 1
+    local c, rest = step.command, step.rest
+    local n = numbers(rest)
+    if c == "wait" then
+        delay = n[1] ?? 0.5
+    elseif c == "move" then
+        return { { kind = "mousemove", x = n[1], y = n[2] } }
+    elseif c == "click" or c == "dbl" then
+        local presses = (c == "dbl") and 2 or 1
+        local frames = { { { kind = "mousemove", x = n[1], y = n[2] } } }
+        for p = 1, presses do
+            table.insert(frames, { { kind = "mousedown", button = "left", x = n[1], y = n[2], clicks = p } })
+            table.insert(frames, { { kind = "mouseup", button = "left", x = n[1], y = n[2] } })
+        end
+        pending = frames
+        return table.remove(pending, 1)
+    elseif c == "scroll" then
+        return { { kind = "mousemove", x = n[1], y = n[2] }, { kind = "scroll", dx = 0, dy = n[3], unit = "pixels", x = n[1], y = n[2] } }
+    elseif c == "type" then
+        local frames = {}
+        for piece in utf8.chars(rest) do
+            table.insert(frames, { { kind = "textinput", text = piece } })
+        end
+        pending = frames
+        return table.remove(pending, 1) ?? {}
+    elseif c == "key" then
+        local name, ctrl = string.match(rest, "^(%S+)%s*(%S*)$")
+        return { { kind = "keydown", key = name, mods = { ctrl = ctrl == "ctrl" } } }
+    elseif c == "snap" then
+        onSnap(rest)
+    elseif c == "quit" then
+        onQuit()
+    end
+    return {}
+end
+
+return script

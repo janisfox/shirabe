@@ -1,0 +1,161 @@
+-- YouTube Music, as the app uses it: every call goes through the page
+-- (services/ytm/bridge) and comes back parsed (services/ytm/parse/pages).
+-- All functions wait for the page, so call them from a task.
+
+local bridge = require("services/ytm/bridge")
+local pages = require("services/ytm/parse/pages")
+
+local api = {}
+
+-- READING ------------------------------------------------------------------------
+
+function api.home(): table
+    return pages.home(bridge.api("browse", { browseId = "FEmusic_home" }))
+end
+
+-- The next part of the home feed (more shelves).
+function api.homeMore(token: string): table
+    return pages.home(bridge.api("browse", { continuation = token }))
+end
+
+-- `params` comes from one of the result's filters (filters[i].params).
+function api.search(query: string, params: string?): table
+    return pages.search(bridge.api("search", { query = query, params = params }))
+end
+
+function api.searchMore(token: string): table
+    return pages.search(bridge.api("search", { continuation = token }))
+end
+
+function api.suggestions(query: string): {string}
+    local response = bridge.api("music/get_search_suggestions", { input = query })
+    local P = require("services/ytm/parse/common")
+    local out = {}
+    for _, s in P.collect(response, "searchSuggestionRenderer") do
+        local text = P.text(s.suggestion)
+        if text then table.insert(out, text) end
+    end
+    return out
+end
+
+function api.album(browseId: string): table
+    return pages.collection(bridge.api("browse", { browseId = browseId }), "album")
+end
+
+-- `id` is a playlist id ("PL…", "LM", "RDCLAK…") or its browse id ("VL…").
+function api.playlist(id: string): table
+    local browseId = (string.sub(id, 1, 2) == "VL") and id or ("VL" .. id)
+    return pages.collection(bridge.api("browse", { browseId = browseId }), "playlist")
+end
+
+function api.likedSongs(): table
+    return api.playlist("LM")
+end
+
+-- More tracks of an album / playlist: (items, next token).
+function api.collectionMore(token: string): ({table}, string?)
+    return pages.collectionMore(bridge.api("browse", { continuation = token }))
+end
+
+function api.artist(browseId: string): table
+    return pages.artist(bridge.api("browse", { browseId = browseId }))
+end
+
+-- Any browse page shown as a list (an artist's "more" pages, moods, ...).
+function api.browse(browseId: string, params: string?): table
+    return bridge.api("browse", { browseId = browseId, params = params })
+end
+
+local LIBRARY = {
+    playlists = "FEmusic_liked_playlists",
+    albums = "FEmusic_liked_albums",
+    artists = "FEmusic_library_corpus_track_artists",
+    songs = "FEmusic_liked_videos",
+    subscriptions = "FEmusic_library_corpus_artists",
+}
+
+-- kind: "playlists" | "albums" | "artists" | "songs" | "subscriptions"
+function api.library(kind: string): table
+    local id = LIBRARY[kind]
+    if not id then error(`unknown library section {kind}`) end
+    return pages.library(bridge.api("browse", { browseId = id }))
+end
+
+function api.libraryMore(token: string): table
+    return pages.library(bridge.api("browse", { continuation = token }))
+end
+
+-- The queue and tabs for a track (and the playlist / radio it plays in).
+function api.watch(videoId: string, playlistId: string?, params: string?): table
+    return pages.watch(bridge.api("next", { videoId = videoId, playlistId = playlistId, params = params, isAudioOnly = true }))
+end
+
+-- Lyrics of a track: { text, source } or nil. `browseId` is watch().lyrics.
+function api.lyrics(browseId: string): table?
+    return pages.lyrics(bridge.api("browse", { browseId = browseId }))
+end
+
+function api.accounts(): {table}
+    return pages.accounts(bridge.api("account/accounts_list", {
+        accountReadMask = { returnOwner = true, returnBrandAccounts = true, returnPersonaAccounts = false },
+        callCircumstance = "SWITCHING_USERS_FULL",
+    }))
+end
+
+-- Artwork as a decoded Image, at about `size` pixels (see parse/common
+-- thumbnailUrl). Fetched by the page: Neyuki's http cannot carry binary bodies.
+function api.image(thumbnails: {table}, size: number): any
+    local P = require("services/ytm/parse/common")
+    local url = P.thumbnailUrl(thumbnails, size)
+    if not url then return nil end
+    local ui = require("@neyuki/ui")
+    return ui.decodeImage(bridge.image(url))
+end
+
+-- WRITING (synced with YouTube Music) ------------------------------------------------
+
+-- status: "LIKE" | "DISLIKE" | "INDIFFERENT" (removes a like or dislike).
+function api.rate(videoId: string, status: string)
+    local endpoint = ({ LIKE = "like/like", DISLIKE = "like/dislike", INDIFFERENT = "like/removelike" })[status]
+    if not endpoint then error(`unknown rating {status}`) end
+    bridge.api(endpoint, { target = { videoId = videoId } })
+end
+
+-- Saves an album / playlist to the library (or removes it).
+function api.savePlaylist(playlistId: string, saved: boolean)
+    bridge.api(saved and "like/like" or "like/removelike", { target = { playlistId = playlistId } })
+end
+
+-- privacy: "PUBLIC" | "UNLISTED" | "PRIVATE". Returns the new playlist id.
+function api.createPlaylist(title: string, description: string?, privacy: string?, videoIds: {string}?): string?
+    local response = bridge.api("playlist/create", {
+        title = title,
+        description = description ?? "",
+        privacyStatus = privacy ?? "PRIVATE",
+        videoIds = videoIds,
+    })
+    return response.playlistId
+end
+
+function api.addToPlaylist(playlistId: string, videoIds: {string})
+    local actions = {}
+    for _, id in videoIds do table.insert(actions, { action = "ACTION_ADD_VIDEO", addedVideoId = id }) end
+    bridge.api("browse/edit_playlist", { playlistId = playlistId, actions = actions })
+end
+
+-- `setVideoId` identifies the entry (tracks of a playlist carry it).
+function api.removeFromPlaylist(playlistId: string, videoId: string, setVideoId: string)
+    bridge.api("browse/edit_playlist", { playlistId = playlistId, actions = {
+        { action = "ACTION_REMOVE_VIDEO", removedVideoId = videoId, setVideoId = setVideoId },
+    } })
+end
+
+function api.deletePlaylist(playlistId: string)
+    bridge.api("playlist/delete", { playlistId = playlistId })
+end
+
+function api.subscribe(channelId: string, subscribed: boolean)
+    bridge.api(subscribed and "subscription/subscribe" or "subscription/unsubscribe", { channelIds = { channelId } })
+end
+
+return api

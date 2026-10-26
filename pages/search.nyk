@@ -1,0 +1,182 @@
+-- Search: the query field with suggestions, filter chips (YouTube Music's own,
+-- localized), the top result and the results list with paging.
+
+local ui = require("@neyuki/ui")
+local common = require("pages/common")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local loader = require("state/loader")
+local api = require("services/ytm/api")
+local tokens = require("theme/tokens")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local search = {}
+
+local FIELD = "search:query"
+local query = nil          -- the submitted query
+local params = nil         -- the selected filter's params
+local typedAt = 0          -- when the field last changed (for suggestion debounce)
+local lastTyped = ""
+
+function search.enter(ctx: table?)
+    if ctx and ctx.win then widgets.focus(FIELD, ctx.win) end
+end
+
+local function submit(text: string, ctx: table)
+    local q = string.match(text, "^%s*(.-)%s*$") ?? ""
+    if q == "" then return end
+    query, params = q, nil
+    widgets.setFieldText(FIELD, q)
+    widgets.focus(nil, ctx.win)
+    require("app/router").scrollTop()
+end
+
+local function resultKey(): string
+    return `search:{query}:{params ?? ""}`
+end
+
+local function suggestionsBox(win: any, x: number, y: number, w: number, ctx: table)
+    local text = widgets.fieldText(FIELD)
+    if widgets.focusedField() ~= FIELD or text == "" or text == query then return end
+    if text ~= lastTyped then
+        lastTyped, typedAt = text, os.clock()
+    end
+    if os.clock() - typedAt < 0.25 then
+        anim.busy = true
+        return
+    end
+    local entry = loader.get(`suggest:{text}`, function() return api.suggestions(text) end)
+    if entry.status ~= "ready" or #entry.value == 0 then return end
+    local h = #entry.value * 34 + 12
+    win:fillRect(x, y, w, h, 0x16161AF5, { radius = 10, shadow = { blur = 24, offsetY = 10, color = 0x00000080 } })
+    for i, suggestion in entry.value do
+        local sy = y + 6 + (i - 1) * 34
+        local st = input.hit(`search:suggest:{i}`, x + 6, sy, w - 12, 34)
+        if st.hover then win:fillRect(x + 6, sy, w - 12, 34, C.hover, { radius = 6 }) end
+        icons.draw(win, "search", x + 16, sy + 10, 14, C.textFaint, { width = 2 })
+        win:text(x + 40, sy + 8, suggestion, { size = 13.5, font = fonts.regular, color = C.text, maxWidth = w - 56, overflow = "ellipsis" })
+        if st.press then submit(suggestion, ctx) end
+    end
+end
+
+-- The highlighted first result: big artwork, title, kind and a play button.
+local function topResult(win: any, top: table, x: number, y: number, w: number, ctx: table): number
+    local h = 128
+    local st = input.hit("search:top", x, y, w, h)
+    local hv = anim.follow("search:top:hover", (st.hover and 1 or 0), tokens.motion.hoverRate)
+    win:fillRect(x, y, w, h, ui.mixColor(0xFFFFFF0D, 0xFFFFFF18, hv), { radius = 12 })
+    media.art(win, top.thumbnails, x + 16, y + 16, 96, 96, { round = top.kind == "artist", radius = 8, kind = top.kind })
+    win:text(x + 128, y + 30, top.title, { size = 22, font = fonts.bold, color = C.text, maxWidth = w - 200, overflow = "ellipsis" })
+    win:text(x + 128, y + 62, media.byline(top), { size = 13.5, font = fonts.regular, color = C.textDim, maxWidth = w - 200, overflow = "ellipsis" })
+    if top.kind and (media.isTrack(top) or top.kind ~= "artist") then
+        local px, py = x + w - 64, y + h / 2 - 22
+        local pst = input.hit("search:top:play", px, py, 44, 44)
+        win:circle(px + 22, py + 22, 22 + (pst.hover and 1 or 0), C.text)
+        icons.draw(win, "play", px + 12, py + 12, 20, 0x111113FF)
+        if pst.click then
+            ctx.play(top)
+            return h
+        end
+    end
+    if st.click then ctx.open(top) end
+    return h
+end
+
+function search.draw(win: any, R: table, ctx: table): number
+    local y = common.header(win, R, "Search")
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+    local fieldW = math.min(560, w)
+
+    local field = widgets.textField(win, FIELD, x, y, fieldW, 42,
+        { placeholder = "What do you want to listen to?", icon = "search", size = 14.5, win = ctx.win, radius = 10 })
+    if field.submitted then submit(widgets.fieldText(FIELD), ctx) end
+    local fieldBottom = y + 42
+    y += 42 + 16
+
+    if not query then
+        local mid = x + fieldW / 2
+        icons.draw(win, "search", mid - 22, y + 30, 44, C.textFaint, { width = 1.4 })
+        win:text(x, y + 88, "Search songs, albums, artists and playlists on YouTube Music.",
+            { size = 13.5, font = fonts.regular, color = C.textDim, align = "center", maxWidth = fieldW })
+        suggestionsBox(win, x, fieldBottom + 4, fieldW, ctx)
+        return (y + 140) - R.y
+    end
+
+    local key = resultKey()
+    local q, p = query, params
+    local entry = loader.get(key, function() return api.search(q, p) end)
+    ctx.retry = function() loader.forget(key) end
+    local stop, below = common.state(win, R, y, ctx, entry)
+    if stop then
+        suggestionsBox(win, x, fieldBottom + 4, fieldW, ctx)
+        return below - R.y + 40
+    end
+    local result = entry.value
+
+    -- Filters: YouTube Music's chips; the selected one shows a way back.
+    local cx = x
+    for i, f in result.filters do
+        if f.params or f.selected then
+            local st, cw = widgets.pill(win, `search:filter:{i}`, f.label, cx, y, { selected = f.selected, height = 30 })
+            if st.click then
+                if f.selected then params = nil else params = f.params end
+                require("app/router").scrollTop()
+            end
+            cx += cw + 8
+        end
+    end
+    y += 30 + 22
+
+    if result.top then
+        y += topResult(win, result.top, x, y, math.min(w, 720), ctx) + 24
+    end
+
+    local pageIndex = 0
+    local sections = result.sections
+    for _, section in sections do
+        if section.title ~= "" then y = common.section(win, x, y, section.title) end
+        for i, item in section.items do
+            if common.visible(R, y, 56) then
+                media.row(win, `search:{pageIndex}:{i}`, item, x, y, w, ctx)
+            end
+            y += 56
+        end
+        pageIndex += 1
+    end
+
+    -- Paging: continuation pages of a filtered search, loaded near the bottom.
+    local token = sections[#sections] and sections[#sections].continuation
+    local n = 1
+    while token do
+        local more = loader.peek(`{key}:more:{n}`)
+        if not more then
+            if y - R.viewBottom < 500 then
+                local t = token
+                loader.get(`{key}:more:{n}`, function() return api.searchMore(t) end)
+            end
+            break
+        end
+        if more.status ~= "ready" then
+            media.spinner(win, x + w / 2, y + 20)
+            y += 50
+            break
+        end
+        local items = (more.value.sections[1] and more.value.sections[1].items) ?? {}
+        for i, item in items do
+            if common.visible(R, y, 56) then media.row(win, `search:more:{n}:{i}`, item, x, y, w, ctx) end
+            y += 56
+        end
+        token = more.value.sections[1] and more.value.sections[1].continuation
+        n += 1
+    end
+
+    suggestionsBox(win, x, fieldBottom + 4, fieldW, ctx)
+    return (y + 30) - R.y
+end
+
+return search

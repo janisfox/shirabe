@@ -1,0 +1,314 @@
+-- Milestone 1 spike: drive a hidden music.youtube.com webview.
+--
+--   neyuki spike/m1.nyk signin            show the page so you can sign in to Google
+--   neyuki spike/m1.nyk status            identity + accounts of the current session
+--   neyuki spike/m1.nyk play <id> [secs]  play a track hidden, then check it reached history
+--   neyuki spike/m1.nyk history           first entries of the account's YTM history
+--   neyuki spike/m1.nyk switch <pageId|owner>  switch the page to a brand account (or back)
+--   neyuki spike/m1.nyk show              open the page visibly (debugging)
+--
+-- Run from the shirabe folder (reads assets/bridge.js). Needs Neyuki >= 0.6.
+
+local ui = require("@neyuki/ui")
+local webview = require("@neyuki/webview")
+local fs = require("@neyuki/fs")
+
+local args = os.args()
+local command = args[1] ?? "status"
+local YTM = "https://music.youtube.com/"
+local SIGNIN = "https://accounts.google.com/ServiceLogin?service=youtube&continue=" .. YTM
+
+-- BRIDGE -----------------------------------------------------------------
+
+local view = nil
+local nextId = 0
+local pending = {}
+local ready = nil       -- last "ready" message (identity of the loaded page)
+local readyCount = 0
+local lastState = nil
+
+local function open(visible: boolean, url: string?)
+    view = webview.open({
+        title = "shirabe — YouTube Music",
+        width = 1100,
+        height = 780,
+        visible = visible,
+        url = url ?? YTM,
+        -- SHIRABE_PROFILE points tests at a throwaway profile.
+        dataDir = os.getenv("SHIRABE_PROFILE") or os.dataDir("shirabe") .. "/webview",
+        initScript = fs.read("assets/bridge.js"),
+        autoplay = true,
+        backgroundThrottling = false,
+        devtools = true,
+    })
+end
+
+local function handle(message: string)
+    local ok, msg = pcall(json.decode, message)
+    if not ok or type(msg) ~= "table" then return end
+    if msg.type == "result" and msg.id ~= nil and pending[msg.id] then
+        pending[msg.id] = { done = true, ok = msg.ok, value = msg.value, error = msg.error }
+    elseif msg.type == "ready" then
+        ready = msg
+        readyCount += 1
+    elseif msg.type == "state" then
+        lastState = msg
+    end
+end
+
+-- Calls a bridge op and waits (inside a task) for its answer.
+local function call(op: string, callArgs: table?, timeout: number?): any
+    nextId += 1
+    local id = nextId
+    pending[id] = { done = false }
+    view:send({ id = id, op = op, args = callArgs ?? {} })
+    local waited = 0
+    while not pending[id].done do
+        waited += task.wait(0.05)
+        if waited > (timeout ?? 15) then
+            pending[id] = nil
+            error(`bridge op {op} timed out`)
+        end
+    end
+    local result = pending[id]
+    pending[id] = nil
+    if not result.ok then error(`bridge op {op} failed: {result.error}`) end
+    return result.value
+end
+
+local function api(endpoint: string, body: table?): table
+    return json.decode(call("api", { endpoint = endpoint, body = body ?? {} }, 30))
+end
+
+-- Waits for the next "ready" after `count` (a page load), up to `timeout` seconds.
+local function waitReady(count: number, timeout: number): table?
+    local waited = 0
+    while readyCount <= count do
+        waited += task.wait(0.1)
+        if waited > timeout then return nil end
+    end
+    return ready
+end
+
+-- INNERTUBE JSON ---------------------------------------------------------
+
+local function collect(node: any, key: string, out: table?): table
+    out = out ?? {}
+    if type(node) == "table" then
+        for k, v in pairs(node) do
+            if k == key then table.insert(out, v) end
+            collect(v, key, out)
+        end
+    end
+    return out
+end
+
+local function text(node: any): string?
+    if type(node) ~= "table" then return nil end
+    if node.simpleText then return node.simpleText end
+    if node.runs then
+        local parts = {}
+        for _, run in node.runs do table.insert(parts, run.text ?? "") end
+        return table.concat(parts)
+    end
+    return nil
+end
+
+local function accounts(): table
+    local body = api("account/accounts_list", {
+        accountReadMask = { returnOwner = true, returnBrandAccounts = true, returnPersonaAccounts = false },
+        callCircumstance = "SWITCHING_USERS_FULL",
+    })
+    local list = {}
+    for _, item in collect(body, "accountItem") do
+        local pageId = nil
+        local endpoint = item.serviceEndpoint
+        for _, token in collect(endpoint, "pageIdToken") do pageId = pageId ?? token.pageId end
+        table.insert(list, {
+            name = text(item.accountName) ?? "?",
+            byline = text(item.accountByline),
+            handle = text(item.channelHandle),
+            pageId = pageId,
+            selected = item.isSelected == true,
+            endpoint = endpoint,
+        })
+    end
+    return list
+end
+
+local function history(limit: number): table
+    local body = api("browse", { browseId = "FEmusic_history" })
+    local items = {}
+    for _, row in collect(body, "musicResponsiveListItemRenderer") do
+        local id = row.playlistItemData and row.playlistItemData.videoId
+        if id then
+            local title = nil
+            for _, column in collect(row, "musicResponsiveListItemFlexColumnRenderer") do
+                title = title ?? text(column.text)
+            end
+            table.insert(items, { videoId = id, title = title ?? "?" })
+            if #items >= limit then break end
+        end
+    end
+    return items
+end
+
+local function printIdentity(id: table)
+    print(`signedIn={id.signedIn} sessionIndex={id.sessionIndex} pageId={id.pageId ?? "-"} datasyncId={id.datasyncId ?? "-"}`)
+end
+
+local function printAccounts(list: table)
+    for _, a in list do
+        print(`  {a.selected and "*" or " "} {a.name}  {a.byline ?? ""} {a.handle ?? ""}  pageId={a.pageId ?? "(owner)"}`)
+    end
+end
+
+local function printHistory(items: table)
+    for i, item in items do print(`  {i}. {item.videoId}  {item.title}`) end
+end
+
+-- COMMANDS ---------------------------------------------------------------
+
+local function requireSignedIn(id: table?): boolean
+    if not id then print("page never became ready") return false end
+    printIdentity(id)
+    if not id.signedIn then
+        -- Tests in a throwaway profile can exercise playback without an account.
+        if os.getenv("SHIRABE_ALLOW_SIGNED_OUT") then return true end
+        print("not signed in: run `neyuki spike/m1.nyk signin` first")
+        return false
+    end
+    return true
+end
+
+local commands = {}
+
+function commands.signin()
+    open(true, SIGNIN)
+    print("sign in to Google in the window; waiting up to 10 minutes...")
+    local waited = 0
+    while not (ready and ready.signedIn) do
+        waited += task.wait(0.25)
+        if waited > 600 then print("gave up waiting") return end
+    end
+    print("signed in:")
+    printIdentity(ready)
+    printAccounts(accounts())
+end
+
+function commands.status()
+    open(false)
+    local id = waitReady(0, 30)
+    if not requireSignedIn(id) then return end
+    print("accounts:")
+    printAccounts(accounts())
+    -- SHIRABE_TEST_MUTE keeps automated runs silent (ads included).
+    if os.getenv("SHIRABE_TEST_MUTE") then call("mute", { muted = true }) end
+end
+
+function commands.history()
+    open(false)
+    if not requireSignedIn(waitReady(0, 30)) then return end
+    printHistory(history(10))
+end
+
+function commands.play()
+    local videoId = args[2] ?? error("usage: play <videoId> [seconds]")
+    local seconds = tonumber(args[3]) ?? 45
+    open(false)
+    if not requireSignedIn(waitReady(0, 30)) then return end
+    local signedIn = ready.signedIn
+    -- "recent" replays the second entry of the history, so the test moves an
+    -- existing track to the top instead of adding a new one.
+    if videoId == "recent" then
+        local entries = history(2)
+        if not entries[2] then print("history has fewer than 2 entries") return end
+        videoId = entries[2].videoId
+        print(`replaying {videoId} ({entries[2].title})`)
+    end
+    if signedIn then
+        print("history before:")
+        printHistory(history(3))
+    end
+    -- SHIRABE_TEST_MUTE keeps automated runs silent (ads included).
+    if os.getenv("SHIRABE_TEST_MUTE") then call("mute", { muted = true }) end
+    print("play:", call("play", { videoId = videoId, via = args[4] }))
+    local shown = ""
+    local waited = 0
+    while waited < seconds do
+        waited += task.wait(1)
+        local s = lastState
+        if s then
+            local line = `{s.videoId} {s.playing and "playing" or `state {s.playerState}`} {math.floor(s.position)}/{math.floor(s.duration)}s vol={s.volume} muted={s.muted}/{s.videoMuted} ad={s.ad} video={math.floor(s.videoTime ?? 0)}/{math.floor(s.videoDuration ?? 0)} — {s.title}`
+            if line ~= shown then print("  " .. line) shown = line end
+        end
+    end
+    call("pause")
+    task.wait(3) -- let the final watch-time ping go out
+    if not signedIn then return end
+    print("history after:")
+    local items = history(5)
+    printHistory(items)
+    print(items[1] and items[1].videoId == videoId and "OK: track is first in history" or "NOT FOUND at the top of history (history can lag a little; re-run `history`)")
+end
+
+function commands.switch()
+    local target = args[2] ?? error("usage: switch <pageId|owner>")
+    open(false)
+    if not requireSignedIn(waitReady(0, 30)) then return end
+    local list = accounts()
+    printAccounts(list)
+    local chosen = nil
+    for _, a in list do
+        if (target == "owner" and a.pageId == nil) or a.pageId == target then chosen = a end
+    end
+    if not chosen then print("no such account") return end
+    -- The switcher's own route: a server-side /signin redirect that moves the
+    -- whole session (cookies) to the chosen identity, then lands on `next`.
+    local signinUrl = nil
+    for _, token in collect(chosen.endpoint, "accountSigninToken") do signinUrl = signinUrl ?? token.signinUrl end
+    if not signinUrl then print("account has no signinUrl:", json.encode(chosen.endpoint)) return end
+    print("switching to", chosen.name, chosen.handle, "via", signinUrl)
+    local before = readyCount
+    call("navigate", { url = "https://music.youtube.com" .. signinUrl })
+    local id = waitReady(before, 30)
+    if not id then print("page did not reload within 30 s; identity now:") id = call("identity") end
+    printIdentity(id)
+    printAccounts(accounts())
+end
+
+function commands.show()
+    open(true)
+    print("close the window to quit")
+end
+
+local run = commands[command] ?? error(`unknown command {command}`)
+-- No pcall around the flow: inside a pcall body task.wait cannot yield, so it
+-- would block and ui.run would never pump the page. A failing task prints its
+-- error; the loop below closes the view once the task is dead either way.
+local flow = task.spawn(run)
+
+ui.run(function(events)
+    if view and view:isOpen() and command ~= "show" and coroutine.status(flow) == "dead" then
+        view:close()
+    end
+    for _, event in events do
+        if event.kind == "webview" then
+            -- YouTube's EU cookie wall. The user decides; only throwaway test
+            -- profiles reject non-essential cookies automatically.
+            if event.type == "load" and string.find(event.url or "", "consent.youtube.com", 1, true) then
+                if os.getenv("SHIRABE_TEST_REJECT_CONSENT") then
+                    print("consent page: rejecting non-essential cookies (test profile)")
+                    view:eval([[document.querySelector('form[action*="/save"] input[name="set_eom"][value="true"]')?.form.submit()]])
+                else
+                    print("consent page: choose your cookie settings in the window")
+                    view:show()
+                end
+            end
+            if os.getenv("SHIRABE_DEBUG") then
+                print("[webview]", event.type, string.sub(event.data or event.url or event.title or "", 1, 160))
+            end
+            if event.type == "message" then handle(event.data) end
+        end
+    end
+end)

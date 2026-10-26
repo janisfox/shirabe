@@ -1,0 +1,22 @@
+-- Where everything goes for a given window size (logical pixels).
+
+local tokens = require("theme/tokens")
+
+local S = tokens.size
+
+return function(w: number, h: number): table
+    local g = S.gutter
+    local railTop = 62
+    local barX = g + S.rail + g
+    local barY = h - g - S.playerbar
+    return {
+        w = w, h = h,
+        logo = { x = g + (S.rail - 34) / 2, y = 15, size = 34 },
+        rail = { x = g, y = railTop, w = S.rail, h = h - railTop - g },
+        playerbar = { x = barX, y = barY, w = w - barX - g, h = S.playerbar },
+        content = { x = barX, y = 0, w = w - barX - g, h = barY - g },
+        -- The draggable strip: the whole top edge except the window buttons.
+        drag = { x = 0, y = 0, w = w - S.caption * 3, h = 36 },
+        captions = { x = w - S.caption * 3, y = 0, w = S.caption * 3, h = 36 },
+    }
+end

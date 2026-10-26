@@ -1,0 +1,163 @@
+-- The YouTube Music page: a hidden web view on music.youtube.com with
+-- assets/bridge.js injected. Neyuki sends `{ id, op, args }` with view:send and
+-- the page answers with postMessage. `bridge.call` waits for the answer inside
+-- a task (task.spawn); everything the page pushes on its own (ready, player
+-- state) lands in `bridge.identity` / `bridge.state` and the `on*` hooks.
+--
+-- Every message from the page is untrusted input: it is parsed defensively and
+-- nothing in it is ever treated as a command.
+
+local webview = require("@neyuki/webview")
+local fs = require("@neyuki/fs")
+
+local bridge = {}
+
+local URL = "https://music.youtube.com/"
+local SIGNIN = "https://accounts.google.com/ServiceLogin?service=youtube&continue=" .. URL
+
+bridge.view = nil
+bridge.identity = nil      -- { signedIn, sessionIndex, pageId, datasyncId } from the last page load
+bridge.loads = 0           -- page loads that reported ready (switching accounts reloads)
+bridge.state = nil         -- last player state pushed by the page
+bridge.consent = false     -- the page is stuck on YouTube's cookie consent wall
+bridge.onReady = nil       -- function(identity)
+bridge.onState = nil       -- function(state)
+bridge.onConsent = nil     -- function()
+
+local nextId = 0
+local pending = {}
+
+-- Opens the page. options: visible, profile (data dir), mute (silence media:
+-- for automated runs)
+function bridge.open(options: table?)
+    local o = options ?? {}
+    bridge.view = webview.open({
+        title = "shirabe — YouTube Music",
+        width = 1100,
+        height = 780,
+        visible = o.visible ?? false,
+        url = URL,
+        dataDir = o.profile ?? fs.join(os.dataDir("shirabe"), "webview"),
+        initScript = fs.read("assets/bridge.js"),
+        autoplay = true,
+        backgroundThrottling = false,
+        devtools = o.devtools ?? false,
+    })
+    bridge.mute = o.mute == true
+end
+
+function bridge.close()
+    if bridge.view then bridge.view:close() end
+    bridge.view = nil
+end
+
+function bridge.isOpen(): boolean
+    return bridge.view ~= nil and bridge.view:isOpen()
+end
+
+-- Shows the page window for Google sign-in (the user signs in themselves).
+function bridge.showSignIn()
+    bridge.view:navigate(SIGNIN)
+    bridge.view:show()
+end
+
+function bridge.show() bridge.view:show() end
+function bridge.hide() bridge.view:hide() end
+
+-- Feeds a `kind = "webview"` event from the frame loop.
+function bridge.handle(event: table)
+    if event.webview ~= bridge.view then return end
+    if event.type == "load" then
+        local url = event.url ?? ""
+        local onConsent = string.find(url, "consent.youtube.com", 1, true) ~= nil
+        if onConsent and not bridge.consent then
+            bridge.consent = true
+            if bridge.onConsent then bridge.onConsent() end
+        elseif not onConsent and string.find(url, "music.youtube.com", 1, true) then
+            bridge.consent = false
+        end
+        return
+    end
+    if event.type ~= "message" then return end
+    local ok, msg = pcall(json.decode, event.data)
+    if not ok or type(msg) ~= "table" then return end
+    if msg.type == "result" then
+        local slot = pending[msg.id]
+        if slot then
+            slot.done, slot.ok, slot.value, slot.error = true, msg.ok == true, msg.value, msg.error
+        end
+    elseif msg.type == "ready" then
+        bridge.identity = {
+            signedIn = msg.signedIn == true,
+            sessionIndex = tonumber(msg.sessionIndex) ?? 0,
+            pageId = (type(msg.pageId) == "string") and msg.pageId or nil,
+            datasyncId = msg.datasyncId,
+        }
+        bridge.loads += 1
+        if bridge.mute then bridge.send("mute", { muted = true }) end
+        if bridge.onReady then bridge.onReady(bridge.identity) end
+    elseif msg.type == "state" then
+        bridge.state = msg
+        if bridge.onState then bridge.onState(msg) end
+    end
+end
+
+-- Sends an op without waiting for the answer.
+function bridge.send(op: string, args: table?)
+    nextId += 1
+    bridge.view:send({ id = nextId, op = op, args = args ?? {} })
+end
+
+-- Sends an op and waits for its answer. Call from a task: the wait yields.
+function bridge.call(op: string, args: table?, timeout: number?): any
+    if not bridge.isOpen() then error("YouTube Music page is not open") end
+    nextId += 1
+    local id = nextId
+    local slot = { done = false }
+    pending[id] = slot
+    bridge.view:send({ id = id, op = op, args = args ?? {} })
+    local waited = 0
+    local limit = timeout ?? 20
+    while not slot.done do
+        waited += task.wait(0.03)
+        if waited > limit then
+            pending[id] = nil
+            error(`YouTube Music did not answer {op} within {limit} s`)
+        end
+    end
+    pending[id] = nil
+    if not slot.ok then error(`{op} failed: {slot.error ?? "unknown error"}`) end
+    return slot.value
+end
+
+-- Waits until the page has reported ready at least `after + 1` times.
+function bridge.waitReady(after: number?, timeout: number?): table?
+    local waited = 0
+    while bridge.loads <= (after ?? 0) do
+        waited += task.wait(0.05)
+        if waited > (timeout ?? 30) then return nil end
+    end
+    return bridge.identity
+end
+
+-- An Innertube request made by the page itself (its cookies, context and
+-- brand-account identity). Returns the decoded JSON.
+function bridge.api(endpoint: string, body: table?): table
+    local text = bridge.call("api", { endpoint = endpoint, body = body ?? {} }, 30)
+    if type(text) ~= "string" then error(`{endpoint}: unexpected answer`) end
+    return json.decode(text)
+end
+
+-- Raw text of an Innertube response (fixtures keep it unparsed).
+function bridge.apiText(endpoint: string, body: table?): string
+    return bridge.call("api", { endpoint = endpoint, body = body ?? {} }, 30)
+end
+
+-- Artwork bytes as a buffer (fetched by the page; see bridge.js `image`).
+function bridge.image(url: string): any
+    local answer = bridge.call("image", { url = url }, 20)
+    if type(answer) ~= "table" or type(answer.data) ~= "string" then error("image: unexpected answer") end
+    return buffer.frombase64(answer.data)
+end
+
+return bridge

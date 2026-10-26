@@ -1,0 +1,119 @@
+-- Immediate-mode input. Each frame: `input.begin(events)`, then widgets call
+-- `input.hit(id, x, y, w, h)` in draw order and get back hover / press / click
+-- state. The widget registered last under the pointer wins ("hot" for the next
+-- frame), so whatever is drawn on top receives the click: caption buttons beat
+-- the title-bar drag area, a card's heart beats the card.
+
+local input = {}
+
+input.mx, input.my = -1, -1   -- pointer position
+input.inside = false          -- pointer is over the window
+input.down = false            -- left button held
+input.pressed = false         -- left button went down this frame
+input.released = false        -- left button went up this frame
+input.clicks = 1              -- 2 for a double click on this frame's press
+input.rightPressed = false
+input.scrollY = 0             -- wheel pixels this frame (positive = content moves up)
+input.scrollX = 0
+input.scrollTaken = false     -- a widget used this frame's wheel input
+input.keys = {}               -- keydown events this frame
+input.text = {}               -- textinput events this frame
+input.ime = {}                -- ime events this frame
+input.cursor = "default"      -- cursor the frame asks for
+input.consumed = false        -- a widget took this frame's press
+
+local hot = nil          -- id under the pointer last frame
+local nextHot = nil      -- id under the pointer this frame (last registered wins)
+local active = nil       -- id the current press started on
+
+function input.begin(events: {table})
+    input.pressed, input.released, input.rightPressed = false, false, false
+    input.scrollY, input.scrollX = 0, 0
+    input.scrollTaken = false
+    input.keys, input.text, input.ime = {}, {}, {}
+    input.cursor = "default"
+    input.consumed = false
+    hot = nextHot
+    nextHot = nil
+    for _, e in events do
+        local kind = e.kind
+        if kind == "mousemove" then
+            input.mx, input.my, input.inside = e.x, e.y, true
+        elseif kind == "mouseleave" then
+            input.inside = false
+            input.mx, input.my = -1, -1
+        elseif kind == "mousedown" then
+            input.mx, input.my = e.x, e.y
+            if e.button == "left" then
+                input.down, input.pressed, input.clicks = true, true, e.clicks ?? 1
+                active = hot
+            elseif e.button == "right" then
+                input.rightPressed = true
+            end
+        elseif kind == "mouseup" and e.button == "left" then
+            input.down, input.released = false, true
+        elseif kind == "blur" then
+            input.down = false
+            active = nil
+        elseif kind == "scroll" then
+            local unit = (e.unit == "lines") and 48 or 1
+            input.scrollY += -(e.dy ?? 0) * unit
+            input.scrollX += -(e.dx ?? 0) * unit
+        elseif kind == "keydown" then
+            table.insert(input.keys, e)
+        elseif kind == "textinput" then
+            table.insert(input.text, e.text)
+        elseif kind == "ime" then
+            table.insert(input.ime, e)
+        end
+    end
+end
+
+-- Call after drawing: forgets a press whose widget is gone.
+function input.finish()
+    if input.released then active = nil end
+end
+
+local function within(x, y, w, h): boolean
+    return input.inside and input.mx >= x and input.my >= y and input.mx < x + w and input.my < y + h
+end
+
+-- Registers a widget and returns its state:
+--   hover    the pointer is over it (and nothing on top of it)
+--   held     the press started on it and the button is still down
+--   press    the button went down on it this frame
+--   click    the button was released over it after a press that started on it
+-- options.cursor: the cursor to show while hovered (default "pointer";
+-- false for none).
+function input.hit(id: any, x: number, y: number, w: number, h: number, options: table?): table
+    if within(x, y, w, h) then nextHot = id end
+    local hover = hot == id and within(x, y, w, h)
+    local state = {
+        hover = hover,
+        held = active == id and input.down,
+        press = hover and input.pressed,
+        click = hover and input.released and active == id,
+        double = hover and input.pressed and input.clicks == 2,
+    }
+    if state.press then input.consumed = true end
+    if hover then
+        local cursor = options and options.cursor
+        if cursor ~= false then input.cursor = cursor ?? "pointer" end
+    end
+    return state
+end
+
+-- Pops the keydown events matching `key` (and `ctrl` when given), so two
+-- handlers never act on the same key.
+function input.key(key: string, ctrl: boolean?): boolean
+    for i, e in input.keys do
+        local mods = e.mods ?? {}
+        if e.key == key and (ctrl == nil or (mods.ctrl == true) == ctrl) then
+            table.remove(input.keys, i)
+            return true
+        end
+    end
+    return false
+end
+
+return input

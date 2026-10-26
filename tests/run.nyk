@@ -1,0 +1,10 @@
+-- Runs the test suite:  neyuki tests/run.nyk   (from the shirabe folder)
+
+local check = require("tests/check")
+
+for _, name in { "tests/test_common", "tests/test_pages" } do
+    print(name)
+    require(name)
+end
+
+if check.summary() > 0 then os.exit(1) end

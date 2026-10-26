@@ -1,0 +1,109 @@
+-- Parser helpers on synthetic data (no fixtures needed).
+
+local check = require("tests/check")
+local P = require("services/ytm/parse/common")
+
+local function artistRun(name, id)
+    return { text = name, navigationEndpoint = { browseEndpoint = { browseId = id,
+        browseEndpointContextSupportedConfigs = { browseEndpointContextMusicConfig = { pageType = "MUSIC_PAGE_TYPE_ARTIST" } } } } }
+end
+local function albumRun(name, id)
+    return { text = name, navigationEndpoint = { browseEndpoint = { browseId = id,
+        browseEndpointContextSupportedConfigs = { browseEndpointContextMusicConfig = { pageType = "MUSIC_PAGE_TYPE_ALBUM" } } } } }
+end
+local SEP = { text = " • " }
+
+check.case("duration parses m:ss and h:mm:ss", function()
+    check.eq(P.duration("3:45"), 225)
+    check.eq(P.duration(" 1:02:03 "), 3723)
+    check.eq(P.duration("0:59"), 59)
+    check.eq(P.duration("12 Songs"), nil)
+    check.eq(P.duration(nil), nil)
+end)
+
+check.case("text joins runs and reads simpleText", function()
+    check.eq(P.text({ runs = { { text = "a" }, { text = "b" } } }), "ab")
+    check.eq(P.text({ simpleText = "s" }), "s")
+    check.eq(P.text("plain"), "plain")
+    check.eq(P.text(nil), nil)
+end)
+
+check.case("subtitle finds artists, album, year and duration", function()
+    local sub = P.subtitle({ artistRun("Queen", "UC1"), { text = " & " }, artistRun("David Bowie", "UC2"), SEP,
+        albumRun("Hot Space", "MPREb_x"), SEP, { text = "1982" }, SEP, { text = "4:08" } })
+    check.eq(#sub.artists, 2, "artists")
+    check.eq(sub.artists[2].name, "David Bowie")
+    check.eq(sub.album.id, "MPREb_x")
+    check.eq(sub.year, 1982)
+    check.eq(sub.duration, 248)
+    check.eq(#sub.extras, 0, "extras")
+end)
+
+check.case("subtitle drops a localized type label only when asked", function()
+    local runs = { { text = "Titel" }, SEP, artistRun("Queen", "UC1"), SEP, { text = "2,7 Mrd. Wiedergaben" } }
+    local labelled = P.subtitle(runs, { skipLabel = true })
+    check.eq(#labelled.extras, 1)
+    check.eq(labelled.extras[1], "2,7 Mrd. Wiedergaben")
+    local plain = P.subtitle(runs)
+    check.eq(plain.extras[1], "Titel")
+end)
+
+check.case("kinds come from endpoints, not text", function()
+    check.eq(P.kindOf(P.endpoint({ watchEndpoint = { videoId = "v", watchEndpointMusicSupportedConfigs =
+        { watchEndpointMusicConfig = { musicVideoType = "MUSIC_VIDEO_TYPE_ATV" } } } })), "song")
+    check.eq(P.kindOf(P.endpoint({ watchEndpoint = { videoId = "v", watchEndpointMusicSupportedConfigs =
+        { watchEndpointMusicConfig = { musicVideoType = "MUSIC_VIDEO_TYPE_OMV" } } } })), "video")
+    check.eq(P.kindOf(P.endpoint({ browseEndpoint = { browseId = "MPREb_abc" } })), "album")
+    check.eq(P.kindOf(P.endpoint({ browseEndpoint = { browseId = "VLPLxyz" } })), "playlist")
+    check.eq(P.kindOf(P.endpoint({ browseEndpoint = { browseId = "UCabc",
+        browseEndpointContextSupportedConfigs = { browseEndpointContextMusicConfig = { pageType = "MUSIC_PAGE_TYPE_USER_CHANNEL" } } } })), "user")
+    check.eq(P.kindOf(nil), nil)
+end)
+
+check.case("thumbnail urls are resized on googleusercontent", function()
+    local thumbs = P.thumbnails({ thumbnails = {
+        { url = "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj", width = 120, height = 120 },
+        { url = "https://lh3.googleusercontent.com/abc=w60-h60-l90-rj", width = 60, height = 60 },
+    } })
+    check.eq(thumbs[1].width, 60, "sorted smallest first")
+    check.eq(P.thumbnailUrl(thumbs, 300), "https://lh3.googleusercontent.com/abc=w300-h300-l90-rj")
+    local yt = P.thumbnails({ thumbnails = {
+        { url = "https://i.ytimg.com/vi/x/hqdefault.jpg", width = 480, height = 360 },
+        { url = "https://i.ytimg.com/vi/x/default.jpg", width = 120, height = 90 },
+    } })
+    check.eq(P.thumbnailUrl(yt, 200), "https://i.ytimg.com/vi/x/hqdefault.jpg", "smallest large enough")
+    check.eq(P.thumbnailUrl({}, 100), nil)
+end)
+
+check.case("continuations in both forms", function()
+    check.eq(P.continuation({ continuations = { { nextContinuationData = { continuation = "old" } } } }), "old")
+    check.eq(P.continuation({ contents = { {}, { continuationItemRenderer = { continuationEndpoint =
+        { continuationCommand = { token = "new" } } } } } }), "new")
+    check.eq(P.continuation({ contents = { {} } }), nil)
+end)
+
+check.case("two-row items without an endpoint are skipped", function()
+    check.eq(P.item({ musicTwoRowItemRenderer = { title = { runs = { { text = "New playlist" } } },
+        navigationEndpoint = { createPlaylistEndpoint = {} } } }), nil)
+end)
+
+check.case("list items read title, artists, album and fixed duration", function()
+    local function column(runs)
+        return { musicResponsiveListItemFlexColumnRenderer = { text = { runs = runs } } }
+    end
+    local item = P.item({ musicResponsiveListItemRenderer = {
+        flexColumns = { column({ { text = "Tragedy" } }), column({ artistRun("STOMACH BOOK", "UCs") }), column({ albumRun("Tragedy", "MPREb_t") }) },
+        fixedColumns = { { musicResponsiveListItemFixedColumnRenderer = { text = { runs = { { text = "2:31" } } } } } },
+        playlistItemData = { videoId = "twvEs-I5tC4", playlistSetVideoId = "SET1" },
+    } })
+    check.ok(item, "item")
+    check.eq(item.kind, "song")
+    check.eq(item.title, "Tragedy")
+    check.eq(item.artists[1].name, "STOMACH BOOK")
+    check.eq(item.album.id, "MPREb_t")
+    check.eq(item.duration, 151)
+    check.eq(item.videoId, "twvEs-I5tC4")
+    check.eq(item.setVideoId, "SET1")
+end)
+
+return check

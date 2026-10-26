@@ -1,0 +1,91 @@
+-- The app-drawn title bar: logo, drag strip, window buttons and the resize
+-- border of the frameless window. Drawn last so it sits on top of everything.
+
+local ui = require("@neyuki/ui")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local tokens = require("theme/tokens")
+local icons = require("theme/icons")
+local logo = require("theme/logo")
+
+local C = tokens.color
+local S = tokens.size
+local titlebar = {}
+
+local intro = { p = 0 }
+
+function titlebar.start()
+    ui.animate(intro, { p = 1 }, 1.1, { easing = "linear", delay = 0.15 })
+end
+
+local EDGE_CURSORS = {
+    n = "nsResize", s = "nsResize", e = "ewResize", w = "ewResize",
+    ne = "neswResize", sw = "neswResize", nw = "nwseResize", se = "nwseResize",
+}
+
+-- The edge or corner (x, y) is on, or nil.
+local function edgeAt(win: any, x: number, y: number, w: number, h: number): string?
+    if win:isMaximized() or not input.inside then return nil end
+    local e = S.edge
+    local ns = (y < e and "n") or (y >= h - e and "s") or ""
+    local ew = (x < e and "w") or (x >= w - e and "e") or ""
+    local direction = ns .. ew
+    if direction == "" then return nil end
+    return direction
+end
+
+-- Resize border first: it must win over everything under it.
+function titlebar.handleEdges(win: any, L: table): boolean
+    local edge = edgeAt(win, input.mx, input.my, L.w, L.h)
+    if not edge then return false end
+    input.cursor = EDGE_CURSORS[edge]
+    if input.pressed then
+        win:startResize(edge)
+        input.consumed = true
+    end
+    return true
+end
+
+function titlebar.draw(win: any, L: table, onEdge: boolean)
+    -- Drag strip and the logo area (registered first: buttons drawn later win).
+    local drag = input.hit("titlebar", L.drag.x, L.drag.y, L.drag.w, L.drag.h, { cursor = false })
+    local logoDrag = input.hit("titlebar-logo", 0, 0, L.rail.x + L.rail.w + S.gutter, L.rail.y, { cursor = false })
+    if not onEdge then
+        for _, st in { drag, logoDrag } do
+            if st.double then
+                if win:isMaximized() then win:restore() else win:maximize() end
+            elseif st.press then
+                win:startDrag()
+            end
+        end
+    end
+
+    logo.draw(win, L.logo.x, L.logo.y, L.logo.size, C.text, intro.p)
+
+    -- Window buttons: minimize, maximize / restore, close.
+    local x = L.captions.x
+    local buttons = {
+        { id = "caption-min", icon = "minimize" },
+        { id = "caption-max", icon = win:isMaximized() and "restore" or "maximize" },
+        { id = "caption-close", icon = "close" },
+    }
+    for i, b in buttons do
+        local bx = x + (i - 1) * S.caption
+        local st = input.hit(b.id, bx, 0, S.caption, L.captions.h, { cursor = "default" })
+        local hv = anim.follow(`{b.id}:hover`, (st.hover and 1 or 0), 22)
+        if hv > 0.01 then
+            local bg = b.id == "caption-close" and C.danger or C.hover
+            win:fillRect(bx, 0, S.caption, L.captions.h, ui.mixColor(bg & 0xFFFFFF00, bg, hv))
+        end
+        icons.draw(win, b.icon, bx + (S.caption - 16) / 2, (L.captions.h - 16) / 2, 16,
+            ui.mixColor(C.textDim, C.text, hv), { width = 1.5 })
+        if st.click then
+            if b.id == "caption-min" then win:minimize()
+            elseif b.id == "caption-max" then
+                if win:isMaximized() then win:restore() else win:maximize() end
+            else win:close() end
+        end
+    end
+end
+
+return titlebar

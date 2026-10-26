@@ -1,0 +1,20 @@
+# Milestone 4: real data. Run muted: SHIRABE_TEST_MUTE=1.
+wait 9
+move 640 420
+snap d1-home
+scroll 640 420 -700
+wait 1.2
+snap d2-home-scrolled
+key k ctrl
+wait 0.4
+type Tragedy STOMACH BOOK
+key enter
+wait 5
+snap d3-search
+click 760 267
+wait 6
+snap d4-playing
+key space
+wait 1
+snap d5-paused
+quit

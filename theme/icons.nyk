@@ -1,0 +1,129 @@
+-- Vector icons on a 24 x 24 grid, drawn as paths so they are crisp at any size
+-- and scale factor. `icons.draw(target, name, x, y, size, color, options?)`;
+-- `options.filled` fills the outline icons that have a solid variant (home,
+-- library, heart) and `options.width` overrides the stroke width.
+
+local ui = require("@neyuki/ui")
+
+local icons = {}
+
+-- A path builder that maps grid coordinates into the target box.
+local function pen(x0: number, y0: number, s: number): table
+    local path = ui.path()
+    local P = { path = path }
+    function P.m(x, y) path:moveTo(x0 + x * s, y0 + y * s) return P end
+    function P.l(x, y) path:lineTo(x0 + x * s, y0 + y * s) return P end
+    function P.q(cx, cy, x, y) path:quadTo(x0 + cx * s, y0 + cy * s, x0 + x * s, y0 + y * s) return P end
+    function P.c(ax, ay, bx, by, x, y)
+        path:cubicTo(x0 + ax * s, y0 + ay * s, x0 + bx * s, y0 + by * s, x0 + x * s, y0 + y * s)
+        return P
+    end
+    function P.z() path:close() return P end
+    function P.circle(cx, cy, r) path:circle(x0 + cx * s, y0 + cy * s, r * s) return P end
+    function P.rect(x, y, w, h, r) path:roundRect(x0 + x * s, y0 + y * s, w * s, h * s, (r ?? 0) * s) return P end
+    function P.line(ax, ay, bx, by) return P.m(ax, ay).l(bx, by) end
+    return P
+end
+
+-- kind: "stroke" (outline), "fill" (always solid), or "both" (outline that
+-- becomes solid with options.filled).
+local defs = {
+    home = { kind = "both", build = function(P)
+        P.m(4, 10).l(12, 3.5).l(20, 10).l(20, 19).q(20, 20, 19, 20).l(14.5, 20).l(14.5, 14.5)
+         .l(9.5, 14.5).l(9.5, 20).l(5, 20).q(4, 20, 4, 19).z()
+    end },
+    search = { kind = "stroke", build = function(P)
+        P.circle(10.8, 10.8, 6.3).line(15.6, 15.6, 20.5, 20.5)
+    end },
+    library = { kind = "both", build = function(P)
+        P.rect(3.5, 4, 3.6, 16, 1).rect(9, 4, 3.6, 16, 1)
+        P.m(14.3, 5.2).l(17.6, 4.3).l(21, 18.6).l(17.7, 19.5).z()
+    end },
+    settings = { kind = "stroke", build = function(P)
+        local first = true
+        for k = 0, 7 do
+            local a = k * math.pi / 4
+            for _, pt in { { -0.36, 7.4 }, { -0.2, 9.6 }, { 0.2, 9.6 }, { 0.36, 7.4 } } do
+                local x, y = 12 + math.cos(a + pt[1]) * pt[2], 12 + math.sin(a + pt[1]) * pt[2]
+                if first then P.m(x, y) first = false else P.l(x, y) end
+            end
+        end
+        P.z().circle(12, 12, 3)
+    end },
+    play = { kind = "fill", build = function(P)
+        P.m(8, 4.8).q(8, 4, 8.8, 4.4).l(19, 11.2).q(19.8, 12, 19, 12.8).l(8.8, 19.6).q(8, 20, 8, 19.2).z()
+    end },
+    pause = { kind = "fill", build = function(P)
+        P.rect(6.5, 4.5, 4, 15, 1.2).rect(13.5, 4.5, 4, 15, 1.2)
+    end },
+    next = { kind = "fill", build = function(P)
+        P.m(5, 5.5).q(5, 4.6, 5.8, 5).l(15, 11.2).q(15.8, 12, 15, 12.8).l(5.8, 19).q(5, 19.4, 5, 18.5).z()
+        P.rect(16.5, 5, 2.6, 14, 1)
+    end },
+    prev = { kind = "fill", build = function(P)
+        P.m(19, 5.5).q(19, 4.6, 18.2, 5).l(9, 11.2).q(8.2, 12, 9, 12.8).l(18.2, 19).q(19, 19.4, 19, 18.5).z()
+        P.rect(4.9, 5, 2.6, 14, 1)
+    end },
+    shuffle = { kind = "stroke", build = function(P)
+        P.m(3, 7).l(6.5, 7).c(11.5, 7, 12.5, 17, 17.5, 17).l(20.5, 17)
+        P.m(3, 17).l(6.5, 17).c(11.5, 17, 12.5, 7, 17.5, 7).l(20.5, 7)
+        P.m(18, 4.2).l(20.8, 7).l(18, 9.8)
+        P.m(18, 14.2).l(20.8, 17).l(18, 19.8)
+    end },
+    ["repeat"] = { kind = "stroke", build = function(P)
+        P.m(20, 7).l(7.5, 7).q(4, 7, 4, 10.5).l(4, 12)
+        P.m(4, 17).l(16.5, 17).q(20, 17, 20, 13.5).l(20, 12)
+        P.m(17.2, 4.2).l(20, 7).l(17.2, 9.8)
+        P.m(6.8, 14.2).l(4, 17).l(6.8, 19.8)
+    end },
+    heart = { kind = "both", build = function(P)
+        P.m(12, 19.5).c(5.5, 15, 3, 11.5, 3.6, 8.3).c(4.3, 4.6, 9.2, 3.6, 12, 7.3)
+         .c(14.8, 3.6, 19.7, 4.6, 20.4, 8.3).c(21, 11.5, 18.5, 15, 12, 19.5).z()
+    end },
+    volume = { kind = "stroke", build = function(P)
+        P.m(4, 9.5).l(7.5, 9.5).l(12, 5.5).l(12, 18.5).l(7.5, 14.5).l(4, 14.5).z()
+        P.m(15.5, 9).q(17.5, 12, 15.5, 15)
+        P.m(18.2, 6.5).q(22.2, 12, 18.2, 17.5)
+    end },
+    lyrics = { kind = "stroke", build = function(P)
+        P.rect(9, 3, 6, 11, 3)
+        P.m(5.8, 11).q(5.8, 17.2, 12, 17.2).q(18.2, 17.2, 18.2, 11)
+        P.line(12, 17.2, 12, 21)
+    end },
+    queue = { kind = "stroke", build = function(P)
+        P.line(4, 6, 16, 6).line(4, 11, 16, 11).line(4, 16, 11, 16)
+        P.m(15, 13.5).l(20.5, 16.5).l(15, 19.5).z()
+    end },
+    minimize = { kind = "stroke", build = function(P) P.line(6.5, 12, 17.5, 12) end },
+    maximize = { kind = "stroke", build = function(P) P.rect(6.5, 6.5, 11, 11, 1.2) end },
+    restore = { kind = "stroke", build = function(P)
+        P.rect(6.5, 9, 8.5, 8.5, 1.2)
+        P.m(9, 9).l(9, 7.7).q(9, 6.5, 10.2, 6.5).l(16.3, 6.5).q(17.5, 6.5, 17.5, 7.7).l(17.5, 13.8)
+         .q(17.5, 15, 16.3, 15).l(15, 15)
+    end },
+    close = { kind = "stroke", build = function(P) P.line(6.5, 6.5, 17.5, 17.5).line(17.5, 6.5, 6.5, 17.5) end },
+    grid = { kind = "fill", build = function(P)
+        P.rect(4, 4, 7, 7, 1.6).rect(13, 4, 7, 7, 1.6).rect(4, 13, 7, 7, 1.6).rect(13, 13, 7, 7, 1.6)
+    end },
+    list = { kind = "stroke", build = function(P)
+        P.line(9, 7, 20, 7).line(9, 12, 20, 12).line(9, 17, 20, 17)
+        P.circle(5, 7, 0.6).circle(5, 12, 0.6).circle(5, 17, 0.6)
+    end },
+    plus = { kind = "stroke", build = function(P) P.line(12, 5, 12, 19).line(5, 12, 19, 12) end },
+}
+
+function icons.draw(target: any, name: string, x: number, y: number, size: number, color: any, options: table?)
+    local def = defs[name]
+    if not def then error(`unknown icon {name}`) end
+    local P = pen(x, y, size / 24)
+    def.build(P)
+    local filled = def.kind == "fill" or (def.kind == "both" and options and options.filled)
+    if filled then
+        target:fillPath(P.path, color)
+    else
+        local width = (options and options.width) ?? 1.8
+        target:strokePath(P.path, color, { width = width * size / 24, cap = "round", join = "round" })
+    end
+end
+
+return icons

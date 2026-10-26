@@ -1,0 +1,100 @@
+-- Development aid: exercises services/ytm/api against the live page with
+-- read-only calls (nothing is played, liked or edited) and prints a summary.
+--   neyuki dev/live_check.nyk
+
+local ui = require("@neyuki/ui")
+local bridge = require("services/ytm/bridge")
+local api = require("services/ytm/api")
+
+-- No pcall around the calls below: they wait with task.wait, which blocks
+-- instead of yielding inside a pcall. A failing call ends the task with its
+-- error printed.
+bridge.open({ visible = false, mute = true })
+
+local main = task.spawn(function()
+    local id = bridge.waitReady(0, 40)
+    if not id or not id.signedIn then
+        print("not signed in")
+        return
+    end
+    print(`live check as {id.pageId ?? "owner"}`)
+    local t0 = os.clock()
+    local function report(label, text)
+        print(string.format("  %-14s %6.0f ms  %s", label, (os.clock() - t0) * 1000, text))
+        t0 = os.clock()
+    end
+
+    local home = api.home()
+    report("home", `{#home.shelves} shelves, first "{home.shelves[1] and home.shelves[1].title}"`)
+    if home.continuation then
+        local more = api.homeMore(home.continuation)
+        report("home more", `{#more.shelves} more shelves`)
+    end
+
+    local suggestions = api.suggestions("rusin")
+    report("suggestions", `{#suggestions}: {table.concat(suggestions, " / ")}`)
+
+    local search = api.search("rusino")
+    local songs = nil
+    for _, f in search.filters do
+        if f.params and not f.selected and songs == nil then songs = f end
+    end
+    report("search", `top={search.top and search.top.title} sections={#search.sections} filters={#search.filters}`)
+    if songs then
+        local filtered = api.search("rusino", songs.params)
+        report("search filter", `[{songs.label}] {#filtered.sections > 0 and #filtered.sections[1].items or 0} items`)
+    end
+
+    local albumId, videoId, thumbs = nil, nil, nil
+    for _, s in search.sections do
+        for _, item in s.items do
+            if item.kind == "album" and not albumId then albumId = item.browseId end
+            if item.kind == "song" and not videoId then
+                videoId = item.videoId
+                thumbs = item.thumbnails
+            end
+        end
+    end
+    if albumId then
+        local album = api.album(albumId)
+        report("album", `{album.title} by {album.artists[1] and album.artists[1].name}: {#album.tracks} tracks`)
+    end
+    local artist = api.artist("UCiMhD4jzUqG-IgPzUmmytRQ")
+    report("artist", `{artist.name}: {#artist.shelves} shelves`)
+    local library = api.library("playlists")
+    report("library", `{#library.items} playlists`)
+    if videoId then
+        local watch = api.watch(videoId)
+        report("watch", `queue {#watch.queue}, lyrics={watch.lyrics ~= nil}`)
+        if watch.lyrics then
+            local lyrics = api.lyrics(watch.lyrics)
+            report("lyrics", lyrics and `{#lyrics.text} chars ({lyrics.source})` or "none")
+        end
+    end
+    if thumbs then
+        local image = api.image(thumbs, 226)
+        report("image", `{image.width}x{image.height} from {string.match(thumbs[1].url, "//([^/]+)/")}`)
+    end
+    if artist.thumbnails[1] then
+        local image = api.image(artist.thumbnails, 544)
+        report("image", `{image.width}x{image.height} from {string.match(artist.thumbnails[1].url, "//([^/]+)/")}`)
+    end
+    for _, shelf in home.shelves do
+        for _, item in shelf.items do
+            if item.thumbnails[1] and string.find(item.thumbnails[1].url, "ytimg.com", 1, true) then
+                local image = api.image(item.thumbnails, 400)
+                report("image", `{image.width}x{image.height} from i.ytimg.com ({item.kind})`)
+                print("done")
+                return
+            end
+        end
+    end
+    print("done (no ytimg thumbnail on home)")
+end)
+
+while bridge.isOpen() do
+    for _, event in ui.poll(0.05) do
+        if event.kind == "webview" then bridge.handle(event) end
+    end
+    if coroutine.status(main) == "dead" then bridge.close() end
+end

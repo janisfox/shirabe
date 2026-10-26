@@ -1,0 +1,110 @@
+-- The player bar: cover, title and artist with the like button on the left,
+-- transport in the middle, playback toggles on the right, and the progress
+-- line along its top edge.
+
+local anim = require("kit/anim")
+local input = require("kit/input")
+local widgets = require("kit/widgets")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+local media = require("kit/media")
+
+local C = tokens.color
+local playerbar = {}
+
+local function clock(seconds: number): string
+    local s = math.max(0, math.floor(seconds))
+    return string.format("%d:%02d", s // 60, s % 60)
+end
+
+-- `player` is state/player; `actions` holds the callbacks (toggle, next, prev,
+-- seek, like, shuffle, cycleRepeat, toggleLyrics, toggleQueue).
+function playerbar.draw(win: any, R: table, player: table, actions: table)
+    glass.panel(win, R.x, R.y, R.w, R.h, { radius = tokens.radius.panel, blur = 0 })
+    local track = player.track
+    local cy = R.y + R.h / 2
+
+    -- Left: cover, title / artist, like.
+    local cover = 44
+    local cx = R.x + 11
+    if track then
+        media.art(win, track.thumbnails, cx, cy - cover / 2, cover, cover, { radius = 7, kind = "song" })
+    else
+        win:fillRect(cx, cy - cover / 2, cover, cover, 0xFFFFFF12, { radius = 7 })
+        icons.draw(win, "lyrics", cx + 12, cy - 10, 20, C.textFaint)
+    end
+    local leftW = math.min(320, R.w * 0.3)
+    local tx = cx + cover + 12
+    local textW = leftW - (tx - R.x) - 40
+    local title = (track and track.title) ?? "Nothing playing"
+    local artist = (track and media.byline(track)) ?? "Pick something to listen to"
+    if player.ad then artist = "Ad" end
+    win:text(tx, cy - 19, title, { size = 14, font = fonts.semibold, color = C.text, maxWidth = textW, overflow = "ellipsis" })
+    win:text(tx, cy + 2, artist, { size = 12.5, font = fonts.regular, color = C.textDim, maxWidth = textW, overflow = "ellipsis" })
+    if track then
+        local liked = track.likeStatus == "LIKE"
+        local like = widgets.iconButton(win, "bar:like", "heart", tx + textW + 6, cy - 15, 30,
+            { active = liked, iconSize = 17, color = liked and 0xF2F2F0FF or nil })
+        if like.click then actions.like() end
+    end
+
+    -- Middle: previous / play-pause / next.
+    local mid = R.x + R.w / 2
+    local enabled = track ~= nil
+    local dim = enabled and nil or C.textFaint
+    if widgets.iconButton(win, "bar:prev", "prev", mid - 70, cy - 17, 34, { iconSize = 17, color = dim }).click and enabled then
+        actions.prev()
+    end
+    local play = input.hit("bar:play", mid - 20, cy - 20, 40, 40)
+    local hv = anim.follow("bar:play:hover", (play.hover and 1 or 0), tokens.motion.hoverRate)
+    local pr = anim.follow("bar:play:press", (play.held and 1 or 0), 30)
+    local r = 19 * (1 + hv * 0.05 - pr * 0.07)
+    win:circle(mid, cy, r, enabled and C.text or 0xF2F2F040)
+    icons.draw(win, player.playing and "pause" or "play", mid - 9, cy - 9, 18, 0x111113FF)
+    if play.click and enabled then actions.toggle() end
+    if widgets.iconButton(win, "bar:next", "next", mid + 36, cy - 17, 34, { iconSize = 17, color = dim }).click and enabled then
+        actions.next()
+    end
+
+    -- Right: shuffle, repeat, lyrics, queue, volume.
+    local right = {
+        { id = "bar:shuffle", icon = "shuffle", on = player.shuffle, act = actions.shuffle },
+        { id = "bar:repeat", icon = "repeat", on = player["repeat"] ~= "off", act = actions.cycleRepeat },
+        { id = "bar:lyrics", icon = "lyrics", on = actions.lyricsOpen and actions.lyricsOpen(), act = actions.toggleLyrics },
+        { id = "bar:queue", icon = "queue", on = actions.queueOpen and actions.queueOpen(), act = actions.toggleQueue },
+        { id = "bar:volume", icon = "volume", on = false, act = nil },
+    }
+    local x = R.x + R.w - 12 - #right * 34
+    for _, b in right do
+        local st = widgets.iconButton(win, b.id, b.icon, x, cy - 17, 34,
+            { iconSize = 17, color = b.on and C.text or nil, active = b.on })
+        if b.on then win:circle(x + 17, cy + 15, 1.6, C.text) end
+        if st.click and b.act then b.act() end
+        x += 34
+    end
+
+    -- Progress along the top edge, with times on hover.
+    local px, pw = R.x + 14, R.w - 28
+    local bar = input.hit("bar:progress", px, R.y - 4, pw, 10)
+    local grow = anim.follow("bar:progress:hover", ((bar.hover or bar.held) and 1 or 0), 20)
+    local frac = (player.duration > 0) and math.clamp(player.position / player.duration, 0, 1) or 0
+    if bar.held and enabled and player.duration > 0 then
+        frac = math.clamp((input.mx - px) / pw, 0, 1)
+        if input.released or not input.down then actions.seek(frac * player.duration) end
+    end
+    if bar.click and enabled and player.duration > 0 then
+        actions.seek(math.clamp((input.mx - px) / pw, 0, 1) * player.duration)
+    end
+    local th = 2 + grow * 2
+    win:fillRect(px, R.y + 1, pw, th, 0xFFFFFF1A, { radius = th / 2 })
+    if frac > 0 then win:fillRect(px, R.y + 1, pw * frac, th, C.text, { radius = th / 2 }) end
+    if grow > 0.05 and enabled then
+        win:circle(px + pw * frac, R.y + 1 + th / 2, 5 * grow, C.text)
+        win:text(px, R.y - 18, clock(frac * player.duration), { size = 11, font = fonts.medium, color = C.textDim, opacity = grow })
+        win:text(px + pw, R.y - 18, clock(player.duration), { size = 11, font = fonts.medium, color = C.textDim, opacity = grow, align = "right" })
+    end
+end
+
+return playerbar

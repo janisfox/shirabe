@@ -1,0 +1,45 @@
+-- A tiny test helper: `check.case(name, f)` runs a test and records failures;
+-- `check.eq` / `check.ok` compare; `check.summary()` prints and returns the
+-- number of failures.
+
+local check = {}
+
+local failures = 0
+local passed = 0
+local current = nil
+
+local function fail(message: string)
+    error(message, 0)
+end
+
+function check.eq(actual: any, expected: any, what: string?)
+    if actual ~= expected then
+        fail(`{what ?? "value"}: expected {tostring(expected)}, got {tostring(actual)}`)
+    end
+end
+
+function check.ok(value: any, what: string?)
+    if not value then fail(`{what ?? "condition"} is not true`) end
+end
+
+function check.case(name: string, f: () -> any)
+    current = name
+    local ok, err = pcall(f)
+    if ok then
+        passed += 1
+    else
+        failures += 1
+        print(`  FAIL {name}: {tostring(err)}`)
+    end
+end
+
+function check.skip(name: string, reason: string)
+    print(`  skip {name}: {reason}`)
+end
+
+function check.summary(): number
+    print(`{passed} passed, {failures} failed`)
+    return failures
+end
+
+return check

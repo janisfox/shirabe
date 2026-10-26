@@ -1,0 +1,74 @@
+-- Asynchronous data for the pages. `loader.get(key, fetch)` returns an entry
+-- { status = "loading" | "ready" | "error", value, age } and starts `fetch` in
+-- a task the first time a key is asked for. Entries belong to the account
+-- generation they were loaded for (state/session), so switching accounts
+-- reloads everything.
+--
+-- A failing fetch ends its task with the error printed; the entry notices the
+-- dead task and turns into "error". (A pcall around the fetch is not an option:
+-- inside one, task.wait blocks instead of yielding.)
+
+local session = require("state/session")
+
+local loader = {}
+
+local entries = {}
+local generation = -1
+
+local function sweep()
+    if generation ~= session.generation then
+        entries = {}
+        generation = session.generation
+    end
+end
+
+function loader.get(key: string, fetch: () -> any): table
+    sweep()
+    -- Nothing can be asked before the page is signed in and has its context
+    -- (an early request fails with "Precondition check failed").
+    if not session.ready() then return { status = "loading" } end
+    local entry = entries[key]
+    if entry == nil then
+        entry = { status = "loading", started = os.clock() }
+        entries[key] = entry
+        local mine = generation
+        entry.thread = task.spawn(function()
+            local value = fetch()
+            if mine == generation then
+                entry.value = value
+                entry.status = "ready"
+                entry.loadedAt = os.clock()
+            end
+        end)
+    elseif entry.status == "loading" and coroutine.status(entry.thread) == "dead" then
+        entry.status = "error"
+    end
+    return entry
+end
+
+-- Peeks without starting a load.
+function loader.peek(key: string): table?
+    sweep()
+    return entries[key]
+end
+
+-- Forgets one key (next get loads it again), or every key starting with `prefix .. ":"`.
+function loader.forget(key: string)
+    entries[key] = nil
+end
+
+function loader.forgetPrefix(prefix: string)
+    for key in pairs(table.clone(entries)) do
+        if string.sub(key, 1, #prefix) == prefix then entries[key] = nil end
+    end
+end
+
+-- Whether anything is still loading (keeps the frame loop awake for spinners).
+function loader.busy(): boolean
+    for _, entry in pairs(entries) do
+        if entry.status == "loading" then return true end
+    end
+    return false
+end
+
+return loader

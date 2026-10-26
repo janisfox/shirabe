@@ -1,0 +1,131 @@
+-- Pages, routes and the transitions between them. A page module has
+--   draw(win, R, ctx, params): number   draws into R (already scrolled) and returns its content height
+--   enter(ctx, params)?                 called when it becomes current
+--   key(params)?                        identity of a route (default: the page id)
+-- A route is a page plus params (an album page for one album id...). The
+-- router keeps a back history of routes, cross-fades between them with a short
+-- slide, and scrolls each route with momentum; a route keeps its scroll
+-- position when you come back to it.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local input = require("kit/input")
+local tokens = require("theme/tokens")
+
+local router = {}
+
+local pages = {}
+local current = nil      -- { page, params, key }
+local previous = nil
+local history = {}       -- routes behind the current one
+local transition = { p = 1 }
+local tween = nil
+local scroll = {}        -- route key -> target scroll offset
+local heights = {}       -- route key -> last content height
+
+local MAX_HISTORY = 50
+
+function router.register(id: string, page: table)
+    pages[id] = page
+end
+
+local function keyOf(page: string, params: table?): string
+    local module = pages[page]
+    if module and module.key and params then return `{page}:{module.key(params)}` end
+    return page
+end
+
+-- The current page id (e.g. "home", "collection").
+function router.current(): string?
+    return current and current.page
+end
+
+function router.currentRoute(): table?
+    return current
+end
+
+function router.canGoBack(): boolean
+    return #history > 0
+end
+
+local function enter(route: table, ctx: table?)
+    previous = current
+    current = route
+    if tween then tween:cancel() end
+    transition.p = previous and 0 or 1
+    tween = ui.animate(transition, { p = 1 }, tokens.motion.page, { easing = "outCubic" })
+    local module = pages[route.page]
+    if module.enter then module.enter(ctx, route.params) end
+end
+
+-- Goes to `page` with `params`. Top-level pages (no params) replace the
+-- history instead of growing it, like switching tabs.
+function router.navigate(page: string, params: table?, ctx: table?)
+    if not pages[page] then return end
+    local key = keyOf(page, params)
+    if current and current.key == key then return end
+    if params then
+        if current then
+            table.insert(history, current)
+            if #history > MAX_HISTORY then table.remove(history, 1) end
+        end
+    else
+        history = {}
+    end
+    enter({ page = page, params = params, key = key }, ctx)
+end
+
+function router.back(ctx: table?): boolean
+    local route = table.remove(history)
+    if not route then return false end
+    enter(route, ctx)
+    return true
+end
+
+-- Scrolls the current route to the top (e.g. after a new search).
+function router.scrollTop()
+    if current then
+        scroll[current.key] = 0
+        anim.set(`scroll:{current.key}`, 0)
+    end
+end
+
+local function drawRoute(win: any, route: table, R: table, ctx: table, opacity: number?, shift: number)
+    local module = pages[route.page]
+    local offset = anim.get(`scroll:{route.key}`) ?? 0
+    if opacity then win:pushOpacity(opacity) end
+    win:pushClip(R.x, R.y, R.w, R.h)
+    local inner = { x = R.x, y = R.y - offset + shift, w = R.w, h = R.h, viewTop = R.y, viewBottom = R.y + R.h,
+        scroll = offset }
+    heights[route.key] = module.draw(win, inner, ctx, route.params) ?? R.h
+    win:popClip()
+    if opacity then win:popOpacity() end
+end
+
+function router.draw(win: any, R: table, ctx: table)
+    if not current then return end
+
+    -- Wheel input over the content scrolls the current route (unless a
+    -- horizontal carousel under the pointer took it).
+    local maxScroll = math.max(0, (heights[current.key] ?? 0) - R.h)
+    local target = scroll[current.key] ?? 0
+    if input.scrollY ~= 0 and not input.scrollTaken
+        and input.mx >= R.x and input.mx < R.x + R.w and input.my >= R.y and input.my < R.y + R.h then
+        target += input.scrollY   -- wheel down (dy < 0) moves the content up
+    end
+    target = math.clamp(target, 0, maxScroll)
+    scroll[current.key] = target
+    anim.follow(`scroll:{current.key}`, target, 16, target)
+
+    local p = transition.p
+    if p < 1 and previous then
+        drawRoute(win, previous, R, ctx, 1 - p, -tokens.motion.pageShift * p * 0.5)
+        drawRoute(win, current, R, ctx, p, tokens.motion.pageShift * (1 - p))
+    elseif p < 1 then
+        drawRoute(win, current, R, ctx, p, tokens.motion.pageShift * (1 - p))
+    else
+        drawRoute(win, current, R, ctx, nil, 0)   -- settled: no opacity group (cheaper)
+    end
+end
+
+return router

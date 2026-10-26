@@ -1,0 +1,60 @@
+-- User settings, persisted as JSON in the per-user config directory. Unknown
+-- or missing keys fall back to the defaults, so old files keep working.
+
+local fs = require("@neyuki/fs")
+
+local settings = {}
+
+local VERSION = 1
+
+local defaults = {
+    version = VERSION,
+    background = {
+        kind = "default",   -- "default" | "color" | "gradient" | "image"
+        color = "#101014",
+        gradient = { from = "#1b1530", to = "#0b1418", angle = 135 },
+        path = nil,         -- image / GIF / animated WebP (copied into the data dir)
+        blur = 28,          -- 0..80
+        dim = 0.35,         -- 0..0.9
+        animate = true,     -- play animated backgrounds
+    },
+}
+
+local dir = os.configDir("shirabe")
+local file = fs.join(dir, "settings.json")
+
+local function merge(base: table, over: any): table
+    local out = table.clone(base)
+    if type(over) ~= "table" then return out end
+    for k, v in pairs(over) do
+        if type(base[k]) == "table" and type(v) == "table" then
+            out[k] = merge(base[k], v)
+        elseif v ~= json.null then
+            out[k] = v
+        end
+    end
+    return out
+end
+
+function settings.load(): table
+    local stored = nil
+    if fs.exists(file) then
+        local ok, decoded = pcall(json.decode, fs.read(file))
+        if ok then stored = decoded end
+    end
+    local values = merge(defaults, stored)
+    values.version = VERSION
+    settings.values = values
+    return values
+end
+
+function settings.save()
+    fs.mkdir(dir, true)
+    -- Written beside the file and renamed over it, so a crash mid-write never
+    -- leaves a truncated settings file behind.
+    local partial = file .. ".tmp"
+    fs.write(partial, json.encode(settings.values, { indent = 2 }))
+    fs.rename(partial, file)
+end
+
+return settings

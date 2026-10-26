@@ -1,0 +1,90 @@
+-- Development aids wired into the frame loop, all off unless an environment
+-- variable asks for them:
+--   SHIRABE_SCRIPT=<file>    replay dev/script input (see dev/script.nyk)
+--   SHIRABE_SNAPSHOT=<dir>   where snapshots go; alone, captures each top page and quits
+--   SHIRABE_TOUR=1           visit each top page for 3 s, print frame times, quit
+--   SHIRABE_STATS=1          start with the F12 frame-time overlay on
+
+local ui = require("@neyuki/ui")
+local fonts = require("theme/fonts")
+
+local harness = {}
+
+local PAGES = { "home", "search", "library" }
+local snapDir = os.getenv("SHIRABE_SNAPSHOT")
+local tour = os.getenv("SHIRABE_TOUR") ~= nil
+local scriptPath = os.getenv("SHIRABE_SCRIPT")
+local devScript = nil
+if scriptPath then
+    devScript = require("dev/script")
+    devScript.load(scriptPath)
+end
+
+harness.showStats = os.getenv("SHIRABE_STATS") ~= nil
+harness.active = tour or devScript ~= nil or snapDir ~= nil
+
+local index, wait = 1, 0
+local stats = { n = 0, draw = 0, frame = 0, worst = 0 }
+local frameTimes = {}
+
+local function snap(win: any, name: string)
+    require("dev/snapshot").write(win, `{snapDir ?? "."}/{name}.ppm`)
+    print("snap", name)
+end
+
+-- Synthetic input events for this frame.
+function harness.events(win: any, dt: number): {table}
+    if not devScript then return {} end
+    local out = devScript.step(dt, function(name) snap(win, name) end, function() win:close() end)
+    for _, e in out do e.window = win end
+    return out
+end
+
+-- After drawing a frame (before present): tours and automatic snapshots.
+function harness.after(win: any, dt: number, navigate: (string) -> any)
+    if tour then
+        wait += dt
+        local st = ui.stats()
+        if wait > 0.5 then
+            stats.n += 1
+            stats.draw += st.draw
+            stats.frame += st.frame
+            stats.worst = math.max(stats.worst, st.frame)
+        end
+        if wait > 3 then
+            local n = math.max(1, stats.n)
+            print(string.format("%-8s frames %3d  draw %5.1f  frame %5.1f ms avg, worst %5.1f",
+                PAGES[index], stats.n, stats.draw / n, stats.frame / n, stats.worst))
+            stats = { n = 0, draw = 0, frame = 0, worst = 0 }
+            index += 1
+            wait = 0
+            if PAGES[index] then navigate(PAGES[index]) else win:close() end
+        end
+    elseif snapDir and not devScript then
+        wait += dt
+        if wait > 2.5 then
+            snap(win, PAGES[index])
+            index += 1
+            wait = 0
+            if PAGES[index] then navigate(PAGES[index]) else win:close() end
+        end
+    end
+end
+
+-- The F12 overlay: last frame's timings and a short average.
+function harness.drawStats(win: any, x: number, y: number)
+    local s = ui.stats()
+    table.insert(frameTimes, s.frame)
+    if #frameTimes > 120 then table.remove(frameTimes, 1) end
+    local worst, sum = 0, 0
+    for _, t in frameTimes do
+        worst = math.max(worst, t)
+        sum += t
+    end
+    local line = string.format("draw %.1f  blur %.1f  present %.1f  frame %.1f ms  (avg %.1f, worst %.1f)  scale %.2f",
+        s.draw, s.blur, s.present, s.frame, sum / #frameTimes, worst, win:scale())
+    win:fillRect(x, y, ui.measureText(line, { size = 11, font = fonts.medium }) + 16, 22, 0x000000B0, { radius = 6 })
+    win:text(x + 8, y + 4, line, { size = 11, font = fonts.medium, color = 0x7CFC9AFF })
+end
+
+return harness

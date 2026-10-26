@@ -1,0 +1,71 @@
+-- Home: YouTube Music's home feed (quick picks, mixes, listen again...),
+-- loading more shelves as you scroll down.
+
+local common = require("pages/common")
+local media = require("kit/media")
+local loader = require("state/loader")
+local api = require("services/ytm/api")
+
+local home = {}
+
+local function greeting(): string
+    local hour = tonumber(os.date("%H")) ?? 12
+    if hour < 5 then return "Good night" end
+    if hour < 12 then return "Good morning" end
+    if hour < 18 then return "Good afternoon" end
+    return "Good evening"
+end
+
+-- Loaded parts of the feed: the first page, then each continuation.
+local function parts(): {table}
+    local list = {}
+    local entry = loader.get("home", function() return api.home() end)
+    table.insert(list, entry)
+    local i = 1
+    while entry.status == "ready" and entry.value.continuation do
+        local next = loader.peek(`home:more:{i}`)
+        if not next then break end
+        table.insert(list, next)
+        entry = next
+        i += 1
+    end
+    return list
+end
+
+function home.draw(win: any, R: table, ctx: table): number
+    local y = common.header(win, R, greeting())
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+
+    local list = parts()
+    local stop, below = common.state(win, R, y, ctx, list[1])
+    ctx.retry = function() require("state/loader").forget("home") end
+    if stop then return below - R.y + 40 end
+
+    for p, entry in list do
+        if entry.status == "ready" then
+            for s, shelf in entry.value.shelves do
+                local h = 400
+                if common.visible(R, y - 40, h + 80) then
+                    h = media.carousel(win, `home:{p}:{s}`, shelf, x, y + (shelf.strapline and 16 or 0), w, ctx)
+                else
+                    h = (shelf.items[1] and shelf.items[1].aspect == nil) and (34 + 4 * 56 + 30) or 260
+                end
+                y += h + (shelf.strapline and 16 or 0)
+            end
+        elseif entry.status == "loading" then
+            media.spinner(win, x + w / 2, y + 20)
+            y += 60
+        end
+    end
+
+    -- Near the bottom: ask for the next part of the feed.
+    local last = list[#list]
+    if last.status == "ready" and last.value.continuation and y - R.viewBottom < 600 then
+        local token = last.value.continuation
+        loader.get(`home:more:{#list}`, function() return api.homeMore(token) end)
+    end
+    return (y + 30) - R.y
+end
+
+return home

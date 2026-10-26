@@ -1,0 +1,431 @@
+-- Shared pieces for reading Innertube (YouTube Music) responses.
+--
+-- Responses are deep trees of "renderers". Everything here is defensive: a
+-- missing branch gives nil, never an error, because YouTube changes shapes
+-- without notice. Kinds are taken from endpoints (pageType, musicVideoType),
+-- never from display text, which is localized (the UI follows the account's
+-- language).
+
+local P = {}
+
+-- Follows `path` (keys and indexes) through nested tables; nil when any step
+-- is missing.
+function P.get(node: any, ...: any): any
+    for _, key in { ... } do
+        if type(node) ~= "table" then return nil end
+        node = node[key]
+    end
+    return node
+end
+
+-- The first value of a single-key wrapper like { musicShelfRenderer = {...} }
+-- for one of the given renderer names, and that name.
+function P.unwrap(node: any, names: {string}): (any, string?)
+    if type(node) ~= "table" then return nil, nil end
+    for _, name in names do
+        if node[name] ~= nil then return node[name], name end
+    end
+    return nil, nil
+end
+
+-- Every value stored under `key` anywhere below `node`, in document order for
+-- arrays.
+function P.collect(node: any, key: string, out: table?): table
+    local found = out ?? {}
+    if type(node) == "table" then
+        if #node > 0 then
+            for _, v in node do P.collect(v, key, found) end
+        else
+            for k, v in pairs(node) do
+                if k == key then table.insert(found, v) end
+                P.collect(v, key, found)
+            end
+        end
+    end
+    return found
+end
+
+-- TEXT -----------------------------------------------------------------------
+
+function P.runs(t: any): {table}
+    if type(t) == "table" and type(t.runs) == "table" then return t.runs end
+    if type(t) == "table" and type(t.simpleText) == "string" then return { { text = t.simpleText } } end
+    return {}
+end
+
+-- Plain text of a text object ({ runs } or { simpleText }) or a string.
+function P.text(t: any): string?
+    if type(t) == "string" then return t end
+    if type(t) ~= "table" then return nil end
+    if type(t.simpleText) == "string" then return t.simpleText end
+    if type(t.runs) ~= "table" then return nil end
+    local parts = {}
+    for _, run in t.runs do table.insert(parts, run.text ?? "") end
+    return table.concat(parts)
+end
+
+local function trim(s: string): string
+    return string.match(s, "^%s*(.-)%s*$") ?? s
+end
+
+-- "3:45" / "1:02:03" -> seconds, or nil.
+function P.duration(text: string?): number?
+    if type(text) ~= "string" then return nil end
+    local t = trim(text)
+    local h, m, s = string.match(t, "^(%d+):(%d%d):(%d%d)$")
+    if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+    m, s = string.match(t, "^(%d+):(%d%d)$")
+    if m then return tonumber(m) * 60 + tonumber(s) end
+    return nil
+end
+
+-- A run that only separates others (" • ", " & ", ", ").
+local function separator(text: string): boolean
+    local t = trim(text)
+    return t == "" or t == "•" or t == "&" or t == "," or t == "·"
+end
+
+-- ENDPOINTS ------------------------------------------------------------------
+
+-- A normalized navigation endpoint:
+--   { kind = "watch", videoId, playlistId?, params?, musicVideoType? }
+--   { kind = "browse", browseId, params?, pageType? }
+--   { kind = "watchPlaylist", playlistId, params? }
+function P.endpoint(node: any): table?
+    if type(node) ~= "table" then return nil end
+    local watch = node.watchEndpoint
+    if type(watch) == "table" and watch.videoId then
+        return {
+            kind = "watch",
+            videoId = watch.videoId,
+            playlistId = watch.playlistId,
+            params = watch.params,
+            musicVideoType = P.get(watch, "watchEndpointMusicSupportedConfigs", "watchEndpointMusicConfig", "musicVideoType"),
+        }
+    end
+    local browse = node.browseEndpoint
+    if type(browse) == "table" and browse.browseId then
+        return {
+            kind = "browse",
+            browseId = browse.browseId,
+            params = browse.params,
+            pageType = P.get(browse, "browseEndpointContextSupportedConfigs", "browseEndpointContextMusicConfig", "pageType"),
+        }
+    end
+    local wp = node.watchPlaylistEndpoint
+    if type(wp) == "table" and wp.playlistId then
+        return { kind = "watchPlaylist", playlistId = wp.playlistId, params = wp.params }
+    end
+    return nil
+end
+
+local VIDEO_KINDS = {
+    MUSIC_VIDEO_TYPE_ATV = "song",
+    MUSIC_VIDEO_TYPE_OMV = "video",
+    MUSIC_VIDEO_TYPE_UGC = "video",
+    MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC = "video",
+    MUSIC_VIDEO_TYPE_PODCAST_EPISODE = "episode",
+}
+
+local PAGE_KINDS = {
+    MUSIC_PAGE_TYPE_ALBUM = "album",
+    MUSIC_PAGE_TYPE_AUDIOBOOK = "album",
+    MUSIC_PAGE_TYPE_ARTIST = "artist",
+    MUSIC_PAGE_TYPE_LIBRARY_ARTIST = "artist",
+    MUSIC_PAGE_TYPE_PLAYLIST = "playlist",
+    MUSIC_PAGE_TYPE_USER_CHANNEL = "user",
+    MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE = "podcast",
+    MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE = "episode",
+}
+
+-- The item kind an endpoint leads to.
+function P.kindOf(e: table?): string?
+    if not e then return nil end
+    if e.kind == "watch" then return VIDEO_KINDS[e.musicVideoType ?? ""] ?? "song" end
+    if e.kind == "watchPlaylist" then return "playlist" end
+    if e.kind == "browse" then
+        local kind = PAGE_KINDS[e.pageType ?? ""]
+        if kind then return kind end
+        local id = e.browseId
+        if string.sub(id, 1, 5) == "MPREb" then return "album" end
+        if string.sub(id, 1, 2) == "VL" then return "playlist" end
+        if string.sub(id, 1, 2) == "UC" then return "artist" end
+    end
+    return nil
+end
+
+-- THUMBNAILS -----------------------------------------------------------------
+
+-- The thumbnail list of a renderer ({ url, width, height }, smallest first).
+function P.thumbnails(node: any): {table}
+    local list = P.collect(node, "thumbnails")[1]
+    if type(list) ~= "table" then return {} end
+    local out = {}
+    for _, t in list do
+        if type(t) == "table" and type(t.url) == "string" then
+            local url = t.url
+            if string.sub(url, 1, 2) == "//" then url = "https:" .. url end
+            table.insert(out, { url = url, width = t.width ?? 0, height = t.height ?? 0 })
+        end
+    end
+    table.sort(out, function(a, b) return a.width < b.width end)
+    return out
+end
+
+-- A URL for roughly `size` pixels wide. googleusercontent / ggpht images are
+-- resized by the server (their "=w..-h.." suffix); others use the smallest
+-- listed size that is large enough.
+function P.thumbnailUrl(thumbs: {table}, size: number): string?
+    if #thumbs == 0 then return nil end
+    local chosen = thumbs[#thumbs]
+    for _, t in thumbs do
+        if t.width >= size then
+            chosen = t
+            break
+        end
+    end
+    local url = chosen.url
+    if string.find(url, "googleusercontent.com", 1, true) or string.find(url, "ggpht.com", 1, true) then
+        local base = string.match(url, "^(.-)=w%d+%-h%d+")
+        if base then
+            local px = math.floor(size)
+            return `{base}=w{px}-h{px}-l90-rj`
+        end
+    end
+    return url
+end
+
+-- SUBTITLES ------------------------------------------------------------------
+
+-- Reads a subtitle's runs: linked artists and album, a duration, a year, and
+-- the remaining plain pieces in order (type labels, play counts...).
+--   options.skipLabel: the first plain piece is a localized type label
+--   ("Song", "Titel", "Single"...) and is dropped
+function P.subtitle(runs: {table}, options: table?): table
+    local out = { artists = {}, album = nil, duration = nil, year = nil, extras = {} }
+    local skipLabel = options and options.skipLabel
+    for _, run in runs do
+        local text = run.text ?? ""
+        local e = P.endpoint(run.navigationEndpoint)
+        local kind = P.kindOf(e)
+        if e and (kind == "artist" or kind == "user") then
+            table.insert(out.artists, { name = text, id = e.browseId })
+        elseif e and kind == "album" then
+            out.album = { name = text, id = e.browseId }
+        elseif not separator(text) then
+            local t = trim(text)
+            if P.duration(t) then
+                out.duration = P.duration(t)
+                out.durationText = t
+            elseif string.match(t, "^%d%d%d%d$") then
+                out.year = tonumber(t)
+            elseif skipLabel then
+                skipLabel = false
+            else
+                table.insert(out.extras, t)
+            end
+        end
+    end
+    return out
+end
+
+-- ITEMS ----------------------------------------------------------------------
+
+local function explicit(node: any): boolean
+    for _, badge in P.collect(node, "musicInlineBadgeRenderer") do
+        if P.get(badge, "icon", "iconType") == "MUSIC_EXPLICIT_BADGE" then return true end
+    end
+    return false
+end
+
+local function likeStatus(node: any): string?
+    local like = P.collect(P.get(node, "menu"), "likeButtonRenderer")[1]
+    return like and like.likeStatus
+end
+
+-- Fills the shared item fields from an endpoint and a parsed subtitle.
+local function finish(item: table, e: table?, sub: table): table
+    item.kind = item.kind ?? P.kindOf(e)
+    if e then
+        item.endpoint = e
+        if e.kind == "watch" then
+            item.videoId = item.videoId ?? e.videoId
+            item.playlistId = item.playlistId ?? e.playlistId
+            item.musicVideoType = e.musicVideoType
+        elseif e.kind == "browse" then
+            item.browseId = e.browseId
+            item.pageType = e.pageType
+            item.params = e.params
+        elseif e.kind == "watchPlaylist" then
+            item.playlistId = e.playlistId
+        end
+    end
+    item.artists = sub.artists
+    item.album = item.album ?? sub.album
+    item.year = sub.year
+    item.extras = sub.extras
+    if item.duration == nil and sub.duration then
+        item.duration, item.durationText = sub.duration, sub.durationText
+    end
+    return item
+end
+
+-- musicResponsiveListItemRenderer: rows in shelves, search, albums, playlists.
+local function listItem(r: table, options: table?): table?
+    local columns = r.flexColumns ?? {}
+    local function column(i)
+        return P.get(columns, i, "musicResponsiveListItemFlexColumnRenderer", "text")
+    end
+    local titleRuns = P.runs(column(1))
+    local title = P.text(column(1))
+    if not title or title == "" then return nil end
+    local e = P.endpoint(r.navigationEndpoint) ?? P.endpoint(titleRuns[1] and titleRuns[1].navigationEndpoint)
+    local videoId = P.get(r, "playlistItemData", "videoId")
+    if not e and videoId then e = { kind = "watch", videoId = videoId } end
+
+    -- Columns after the title: artists / type / counts, and (in playlists) the album.
+    local subRuns = {}
+    for i = 2, #columns do
+        local runs = P.runs(column(i))
+        if #runs > 0 then
+            if #subRuns > 0 then table.insert(subRuns, { text = " • " }) end
+            for _, run in runs do table.insert(subRuns, run) end
+        end
+    end
+    local sub = P.subtitle(subRuns, options)
+    local item = {
+        title = title,
+        subtitle = P.text({ runs = subRuns }),
+        videoId = videoId,
+        setVideoId = P.get(r, "playlistItemData", "playlistSetVideoId"),
+        index = tonumber(P.text(r.index) ?? ""),
+        thumbnails = P.thumbnails(r.thumbnail),
+        explicit = explicit(r.badges),
+        likeStatus = likeStatus(r),
+        unavailable = r.musicItemRendererDisplayPolicy == "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT",
+    }
+    local fixed = P.text(P.get(r, "fixedColumns", 1, "musicResponsiveListItemFixedColumnRenderer", "text"))
+    if fixed and P.duration(fixed) then item.duration, item.durationText = P.duration(fixed), fixed end
+    return finish(item, e, sub)
+end
+
+-- musicTwoRowItemRenderer: cards in carousels and grids.
+local function twoRowItem(r: table, options: table?): table?
+    local title = P.text(r.title)
+    if not title or title == "" then return nil end
+    local e = P.endpoint(r.navigationEndpoint)
+    if not e then return nil end   -- e.g. the "New playlist" tile (createPlaylistEndpoint)
+    local subRuns = P.runs(r.subtitle)
+    local item = {
+        title = title,
+        subtitle = P.text(r.subtitle),
+        thumbnails = P.thumbnails(r.thumbnailRenderer),
+        explicit = explicit(r.subtitleBadges),
+        aspect = (r.aspectRatio == "MUSIC_TWO_ROW_ITEM_THUMBNAIL_ASPECT_RATIO_RECTANGLE_16_9") and "wide" or "square",
+    }
+    return finish(item, e, P.subtitle(subRuns, options))
+end
+
+-- musicMultiRowListItemRenderer: podcast episodes.
+local function multiRowItem(r: table): table?
+    local title = P.text(r.title)
+    if not title then return nil end
+    local e = P.endpoint(r.onTap) ?? P.endpoint(P.get(r.title, "runs", 1, "navigationEndpoint"))
+    local item = { title = title, subtitle = P.text(r.subtitle), thumbnails = P.thumbnails(r.thumbnail), kind = "episode",
+        description = P.text(r.description) }
+    return finish(item, e, P.subtitle(P.runs(r.subtitle)))
+end
+
+-- playlistPanelVideoRenderer: entries of the play queue (`next`).
+local function queueItem(r: table): table?
+    local title = P.text(r.title)
+    if not title then return nil end
+    local e = P.endpoint(r.navigationEndpoint)
+    local item = {
+        title = title,
+        subtitle = P.text(r.longBylineText),
+        videoId = r.videoId,
+        thumbnails = P.thumbnails(r.thumbnail),
+        selected = r.selected == true,
+        duration = P.duration(P.text(r.lengthText)),
+        durationText = P.text(r.lengthText),
+        setVideoId = r.playlistSetVideoId,
+    }
+    return finish(item, e, P.subtitle(P.runs(r.longBylineText)))
+end
+
+-- Any item wrapper -> normalized item, or nil for wrappers that are not items.
+-- Item fields: kind ("song" | "video" | "episode" | "album" | "playlist" |
+-- "artist" | "user" | "podcast"), title, subtitle, artists { name, id },
+-- album { name, id }, year, duration (s), durationText, thumbnails, videoId,
+-- playlistId, browseId, params, setVideoId, index, explicit, likeStatus,
+-- extras (plain subtitle pieces), endpoint.
+function P.item(wrapper: any, options: table?): table?
+    if type(wrapper) ~= "table" then return nil end
+    local r, name = P.unwrap(wrapper, {
+        "musicResponsiveListItemRenderer", "musicTwoRowItemRenderer",
+        "musicMultiRowListItemRenderer", "playlistPanelVideoRenderer",
+    })
+    if not r then
+        -- The queue wraps entries again when they have alternatives (song / video).
+        local alt = P.get(wrapper, "playlistPanelVideoWrapperRenderer", "primaryRenderer")
+        if alt then return P.item(alt, options) end
+        return nil
+    end
+    if name == "musicResponsiveListItemRenderer" then return listItem(r, options) end
+    if name == "musicTwoRowItemRenderer" then return twoRowItem(r, options) end
+    if name == "musicMultiRowListItemRenderer" then return multiRowItem(r) end
+    return queueItem(r)
+end
+
+-- Items of a contents array (skipping anything that is not an item).
+function P.items(contents: any, options: table?): {table}
+    local out = {}
+    if type(contents) ~= "table" then return out end
+    for _, wrapper in contents do
+        local item = P.item(wrapper, options)
+        if item then table.insert(out, item) end
+    end
+    return out
+end
+
+-- CONTINUATIONS --------------------------------------------------------------
+
+-- The token for the next page of a shelf / grid / section list, in either the
+-- old ("continuations") or the new ("continuationItemRenderer") form.
+function P.continuation(node: any): string?
+    local old = P.get(node, "continuations", 1)
+    if type(old) == "table" then
+        local data = old.nextContinuationData ?? old.nextRadioContinuationData
+        if data and data.continuation then return data.continuation end
+    end
+    local contents = type(node) == "table" and (node.contents ?? node.items) or nil
+    if type(contents) == "table" then
+        local last = contents[#contents]
+        local token = P.get(last, "continuationItemRenderer", "continuationEndpoint", "continuationCommand", "token")
+        if token then return token end
+    end
+    return nil
+end
+
+-- The items and next token of a continuation response, whatever its shape.
+function P.continuationItems(response: table, options: table?): ({table}, string?)
+    local actions = response.onResponseReceivedActions ?? response.onResponseReceivedEndpoints
+    if type(actions) == "table" then
+        for _, action in actions do
+            local list = P.get(action, "appendContinuationItemsAction", "continuationItems")
+            if list then return P.items(list, options), P.continuation({ contents = list }) end
+        end
+    end
+    local cc = response.continuationContents
+    if type(cc) == "table" then
+        for _, part in pairs(cc) do
+            if type(part) == "table" then
+                return P.items(part.contents ?? part.items, options), P.continuation(part)
+            end
+        end
+    end
+    return {}, nil
+end
+
+return P

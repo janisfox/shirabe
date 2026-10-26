@@ -1,0 +1,81 @@
+-- Pieces shared by the pages: the page header, section labels, skeletons and
+-- the loading / error / signed-out states.
+
+local tokens = require("theme/tokens")
+local fonts = require("theme/fonts")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local session = require("state/session")
+
+local C = tokens.color
+local common = {}
+
+common.PAD = 12          -- horizontal inset of page content inside the content area
+common.TOP = 44          -- where the page title starts (just under the drag strip)
+
+-- Big display title, optional subtitle. Returns the y below it.
+function common.header(win: any, R: table, title: string, subtitle: string?): number
+    local x = R.x + common.PAD
+    local y = R.y + common.TOP
+    local _, th = win:text(x, y, title, { size = 26, font = fonts.display, color = C.text,
+        maxWidth = R.w - common.PAD * 2, overflow = "ellipsis" })
+    y += th + 2
+    if subtitle then
+        local _w, sh = win:text(x, y + 2, subtitle, { size = 13.5, font = fonts.regular, color = C.textDim })
+        y += sh + 6
+    end
+    return y + 14
+end
+
+-- Section label ("Quick picks").
+function common.section(win: any, x: number, y: number, label: string): number
+    local _, h = win:text(x, y, label, { size = 17, font = fonts.bold, color = C.text })
+    return y + h + 12
+end
+
+-- A grey placeholder block.
+function common.skeleton(win: any, x: number, y: number, w: number, h: number, radius: number?)
+    win:fillRect(x, y, w, h, C.skeleton, { radius = radius ?? 6 })
+end
+
+-- True when a block at [y, y + h) is inside the visible part of the page.
+function common.visible(R: table, y: number, h: number): boolean
+    return y + h >= R.viewTop and y <= R.viewBottom
+end
+
+-- Draws what a page shows while its data is not there. Returns true when the
+-- caller should stop drawing (nothing to show yet), and the y below the notice.
+--   entry: a state/loader entry (nil when the page cannot load yet)
+function common.state(win: any, R: table, y: number, ctx: table, entry: table?): (boolean, number)
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+    local status = session.status
+    if status == "signedOut" then
+        win:text(x, y, "Sign in to YouTube Music to see your music.", { size = 14, font = fonts.regular, color = C.textDim })
+        local st = widgets.pill(win, "common:signin", "Sign in with Google", x, y + 32, { primary = true, height = 36 })
+        if st.click then session.signIn() end
+        win:text(x, y + 82, "A window opens with Google's own sign-in page; Shirabe never sees your password.",
+            { size = 12, font = fonts.regular, color = C.textFaint, maxWidth = w })
+        return true, y + 110
+    end
+    if status == "consent" then
+        win:text(x, y, "YouTube is asking about cookies in its window. Choose there, then come back.",
+            { size = 14, font = fonts.regular, color = C.textDim, maxWidth = w })
+        return true, y + 40
+    end
+    if status == "connecting" or status == "switching" or not entry or entry.status == "loading" then
+        media.spinner(win, x + 24, y + 12)
+        local label = (status == "switching") and "Switching account…" or ((status == "connecting") and "Connecting to YouTube Music…" or "Loading…")
+        win:text(x + 52, y + 3, label, { size = 13, font = fonts.regular, color = C.textDim })
+        return true, y + 40
+    end
+    if entry.status == "error" then
+        win:text(x, y, "Couldn't load this from YouTube Music.", { size = 14, font = fonts.regular, color = C.textDim })
+        local st = widgets.pill(win, "common:retry", "Try again", x, y + 30, { height = 32 })
+        if st.click and ctx.retry then ctx.retry() end
+        return true, y + 72
+    end
+    return false, y
+end
+
+return common

@@ -1,0 +1,105 @@
+-- The connection to YouTube Music: opens the hidden page, follows its state
+-- (connecting / consent / signed out / ready / switching), restores the
+-- account the user picked last time, and switches accounts.
+--
+-- `session.generation` changes whenever the signed-in identity changes, so
+-- cached data (state/loader) from another account is never shown.
+
+local bridge = require("services/ytm/bridge")
+local api = require("services/ytm/api")
+local settings = require("state/settings")
+
+local session = {}
+
+session.status = "connecting"  -- "connecting" | "consent" | "signedOut" | "ready" | "switching"
+session.identity = nil
+session.accounts = nil         -- from accounts_list (the selected one has selected = true)
+session.account = nil          -- the active account
+session.generation = 0
+session.error = nil
+
+local switchingTo = nil        -- pageId (or "owner") a switch is waiting for
+
+local function wanted(): string?
+    local account = settings.values.account
+    return account and account.pageId
+end
+
+local function loadAccounts()
+    task.spawn(function()
+        local list = api.accounts()
+        session.accounts = list
+        for _, a in list do
+            if a.selected then session.account = a end
+        end
+        -- Restore the account picked last time (YouTube may have reset it).
+        local target = wanted()
+        local current = session.identity and session.identity.pageId
+        if target and target ~= (current ?? "owner") and not switchingTo then
+            for _, a in list do
+                if (a.pageId ?? "owner") == target then session.switchTo(a) end
+            end
+        end
+    end)
+end
+
+function session.start(options: table?)
+    local o = options ?? {}
+    bridge.open({
+        visible = false,
+        mute = o.mute,
+        profile = o.profile,
+    })
+    bridge.onReady = function(identity)
+        local previous = session.identity
+        session.identity = identity
+        if not identity.signedIn then
+            session.status = "signedOut"
+            session.generation += 1
+            return
+        end
+        -- Signed in: hide the window if it was shown for sign-in or consent.
+        bridge.hide()
+        if not previous or previous.pageId ~= identity.pageId or not previous.signedIn then
+            session.generation += 1
+        end
+        if switchingTo and (identity.pageId ?? "owner") == switchingTo then switchingTo = nil end
+        session.status = switchingTo and "switching" or "ready"
+        loadAccounts()
+    end
+    bridge.onConsent = function()
+        session.status = "consent"
+        bridge.show()
+    end
+end
+
+-- Webview events from the frame loop. Closing the page window (after sign-in
+-- or consent) only hides it: the page is the player.
+function session.handle(event: table)
+    if event.type == "close" and event.webview == bridge.view then
+        bridge.hide()
+        return
+    end
+    bridge.handle(event)
+end
+
+function session.signIn()
+    bridge.showSignIn()
+end
+
+-- Switches the page to `account` (an entry of session.accounts) through
+-- YouTube's own /signin redirect; the choice is remembered.
+function session.switchTo(account: table)
+    if not account.signinUrl then return end
+    switchingTo = account.pageId ?? "owner"
+    settings.values.account = { pageId = switchingTo, name = account.name, handle = account.handle }
+    settings.save()
+    session.status = "switching"
+    bridge.send("navigate", { url = "https://music.youtube.com" .. account.signinUrl })
+end
+
+function session.ready(): boolean
+    return session.status == "ready"
+end
+
+return session

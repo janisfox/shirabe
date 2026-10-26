@@ -1,0 +1,44 @@
+# Milestone 2 shell walk-through (1280 x 800 window).
+wait 1.5
+move 640 400
+# Rail -> Search: the field gets focus, typing and IME-free text input.
+click 35 140
+wait 0.6
+snap s1-search-focused
+type ループザルーム rusino
+wait 0.3
+snap s2-typed
+key backspace
+key enter
+wait 0.4
+snap s3-submitted
+click 194 169
+wait 0.4
+snap s4-filter-albums
+# Ctrl+3 -> Library, then move the chip pill.
+key 3 ctrl
+wait 0.6
+click 173 111
+wait 0.08
+snap s5-pill-moving
+wait 0.6
+snap s6-playlists
+click 1099 111
+wait 0.5
+snap s7-list
+click 1063 111
+wait 0.4
+move 170 230
+wait 0.5
+snap s8-tile-hover
+# Home, scrolled with the wheel.
+click 35 94
+wait 0.6
+scroll 640 400 -600
+wait 0.8
+snap s9-home-scrolled
+# A player-bar toggle shows a toast.
+click 1176 761
+wait 0.4
+snap s10-toast
+quit

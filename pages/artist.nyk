@@ -1,0 +1,90 @@
+-- An artist: a wide banner with name, audience and Play / Radio, then top
+-- songs and the carousels (albums, singles, videos, related artists...).
+-- params: { id = channel browse id, title? }
+
+local common = require("pages/common")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local loader = require("state/loader")
+local api = require("services/ytm/api")
+local images = require("services/images")
+local tokens = require("theme/tokens")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local artist = {}
+
+function artist.key(params: table): string
+    return params.id
+end
+
+function artist.draw(win: any, R: table, ctx: table, params: table): number
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+    local id = params.id
+    local entry = loader.get(`artist:{id}`, function() return api.artist(id) end)
+    ctx.retry = function() loader.forget(`artist:{id}`) end
+    local stop, below = common.state(win, R, R.y + common.TOP, ctx, entry)
+    if stop then return below - R.y + 40 end
+    local a = entry.value
+
+    -- Banner: the artist image across the content width, fading into the page.
+    local bannerH = math.floor(math.min(360, w * 0.36))
+    local top = R.y + 8
+    local image, fade = images.get(a.thumbnails, w * win:scale())
+    if image then
+        win:pushClip(x, top, w, bannerH, { radius = 14 })
+        win:drawImage(image, x, top, { width = w, height = bannerH, fit = "cover", opacity = fade })
+        win:fillRect(x, top, w, bannerH, "#000000", { gradient = { angle = 90, stops = {
+            { 0, "#00000000" }, { 0.45, "#00000033" }, { 1, "#000000c0" } } } })
+        win:popClip()
+    else
+        win:fillRect(x, top, w, bannerH, 0xFFFFFF0D, { radius = 14 })
+    end
+    local nx, ny = x + 24, top + bannerH - 120
+    win:text(nx, ny, a.name, { size = 44, font = fonts.displayHeavy ?? fonts.display, color = C.text, maxWidth = w - 48, overflow = "ellipsis" })
+    local facts = {}
+    if a.monthly then table.insert(facts, a.monthly) end
+    if a.subscribers then table.insert(facts, `{a.subscribers} subscribers`) end
+    win:text(nx, ny + 58, table.concat(facts, "  •  "), { size = 13, font = fonts.medium, color = C.textDim })
+    local bx = nx
+    if a.play then
+        local st, pw = widgets.pill(win, "artist:play", "Play", bx, ny + 84, { primary = true, icon = "play", height = 34 })
+        if st.click then ctx.playEndpoint(a.play) end
+        bx += pw + 10
+    end
+    if a.radio then
+        local st = widgets.pill(win, "artist:radio", "Radio", bx, ny + 84, { icon = "shuffle", height = 34 })
+        if st.click then ctx.playEndpoint(a.radio) end
+    end
+    local y = top + bannerH + 30
+
+    for s, shelf in a.shelves do
+        if shelf.layout == "list" then
+            y = common.section(win, x, y, shelf.title)
+            for i, item in shelf.items do
+                if common.visible(R, y, 56) then
+                    media.row(win, `artist:{id}:{s}:{i}`, item, x, y, w, ctx, { showAlbum = true })
+                end
+                y += 56
+            end
+            y += 30
+        else
+            if common.visible(R, y - 40, 420) then
+                y += media.carousel(win, `artist:{id}:{s}`, shelf, x, y, w, ctx)
+            else
+                y += 300
+            end
+        end
+    end
+
+    if a.about then
+        y = common.section(win, x, y, "About")
+        local _, h = win:text(x, y, a.about, { size = 13.5, font = fonts.regular, color = C.textDim,
+            maxWidth = math.min(w, 860), lineHeight = 1.45 })
+        y += h + 30
+    end
+    return (y + 10) - R.y
+end
+
+return artist

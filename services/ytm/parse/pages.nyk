@@ -1,0 +1,337 @@
+-- Page parsers: home, search, collections (album / playlist / Liked Music),
+-- artist, library, watch (queue + tabs), lyrics and accounts. Each takes a
+-- decoded Innertube response and returns plain tables of normalized items
+-- (see common.nyk `P.item`).
+
+local P = require("services/ytm/parse/common")
+
+local pages = {}
+
+-- The section list of a browse / search response (single- or two-column).
+local function sectionList(response: table): table?
+    local tabs = P.get(response, "contents", "singleColumnBrowseResultsRenderer", "tabs")
+        ?? P.get(response, "contents", "tabbedSearchResultsRenderer", "tabs")
+    if tabs then
+        for _, tab in tabs do
+            local list = P.get(tab, "tabRenderer", "content", "sectionListRenderer")
+            if list then return list end
+        end
+    end
+    return P.get(response, "contents", "twoColumnBrowseResultsRenderer", "secondaryContents", "sectionListRenderer")
+        ?? P.get(response, "contents", "sectionListRenderer")
+end
+
+-- A carousel or plain shelf -> { title, strapline?, items, more? }.
+local function shelf(wrapper: table, options: table?): table?
+    local carousel = wrapper.musicCarouselShelfRenderer
+    if carousel then
+        local header = P.get(carousel, "header", "musicCarouselShelfBasicHeaderRenderer")
+            ?? P.get(carousel, "header", "musicCarouselShelfHeaderRenderer")
+        local more = P.endpoint(P.get(header, "moreContentButton", "buttonRenderer", "navigationEndpoint"))
+            ?? P.endpoint(P.get(header, "title", "runs", 1, "navigationEndpoint"))
+        return {
+            title = P.text(header and header.title) ?? "",
+            strapline = P.text(header and header.strapline),
+            items = P.items(carousel.contents, options),
+            more = more,
+            layout = "carousel",
+        }
+    end
+    local plain = wrapper.musicShelfRenderer
+    if plain then
+        return {
+            title = P.text(plain.title) ?? "",
+            items = P.items(plain.contents, options),
+            more = P.endpoint(plain.bottomEndpoint),
+            continuation = P.continuation(plain),
+            layout = "list",
+        }
+    end
+    return nil
+end
+
+-- HOME -------------------------------------------------------------------------
+
+-- { shelves = { shelf... }, continuation? }. Also reads a continuation page of
+-- the home feed (`browse` with { continuation = token }).
+function pages.home(response: table): table
+    local list = sectionList(response) ?? P.get(response, "continuationContents", "sectionListContinuation")
+    local out = { shelves = {}, continuation = nil }
+    if not list then return out end
+    for _, wrapper in list.contents ?? {} do
+        local s = shelf(wrapper)
+        if s and #s.items > 0 then table.insert(out.shelves, s) end
+    end
+    out.continuation = P.continuation(list)
+    out.moods = {}
+    local chips = P.collect(P.get(list, "header"), "chipCloudChipRenderer")
+    for _, chip in chips do
+        local e = P.endpoint(chip.navigationEndpoint)
+        if e then table.insert(out.moods, { label = P.text(chip.text) ?? "", endpoint = e }) end
+    end
+    return out
+end
+
+-- SEARCH -----------------------------------------------------------------------
+
+-- { top?, sections = { { title, items, continuation? } }, filters = { { label, params, selected } } }
+-- `top` is the highlighted result: an item plus `related` items shown with it.
+-- Unfiltered results start their subtitle with a type label, which is dropped.
+function pages.search(response: table): table
+    local out = { top = nil, sections = {}, filters = {} }
+    local list = sectionList(response)
+    if not list then
+        -- A continuation page of a filtered search.
+        local items, token = P.continuationItems(response)
+        if #items > 0 then table.insert(out.sections, { title = "", items = items, continuation = token }) end
+        return out
+    end
+    for _, chip in P.collect(P.get(list, "header"), "chipCloudChipRenderer") do
+        local params = P.get(chip, "navigationEndpoint", "searchEndpoint", "params")
+        table.insert(out.filters, {
+            label = P.text(chip.text) ?? "",
+            params = params,
+            selected = chip.isSelected == true,
+        })
+    end
+    local filtered = false
+    for _, f in out.filters do
+        if f.selected then filtered = true end
+    end
+    local label = { skipLabel = not filtered }
+    local loose = { title = "", items = {} }
+    for _, wrapper in list.contents ?? {} do
+        local card = wrapper.musicCardShelfRenderer
+        if card then
+            local top = {
+                title = P.text(card.title) ?? "",
+                subtitle = P.text(card.subtitle),
+                thumbnails = P.thumbnails(card.thumbnail),
+            }
+            local e = P.endpoint(card.onTap) ?? P.endpoint(P.get(card, "title", "runs", 1, "navigationEndpoint"))
+                ?? P.endpoint(P.get(card, "buttons", 1, "buttonRenderer", "command"))
+            local sub = P.subtitle(P.runs(card.subtitle), label)
+            top.kind = P.kindOf(e)
+            top.endpoint = e
+            top.artists, top.album, top.duration, top.durationText = sub.artists, sub.album, sub.duration, sub.durationText
+            if e and e.kind == "watch" then top.videoId = e.videoId end
+            if e and e.kind == "browse" then top.browseId = e.browseId end
+            top.related = P.items(card.contents, label)
+            out.top = top
+        elseif wrapper.musicShelfRenderer then
+            local s = shelf(wrapper, label)
+            if s and #s.items > 0 then table.insert(out.sections, s) end
+        elseif wrapper.itemSectionRenderer then
+            for _, item in P.items(wrapper.itemSectionRenderer.contents, label) do
+                table.insert(loose.items, item)
+            end
+        end
+    end
+    if #loose.items > 0 then table.insert(out.sections, loose) end
+    return out
+end
+
+-- COLLECTIONS (album, playlist, Liked Music) -------------------------------------
+
+local function collectionHeader(response: table): table
+    local header = P.collect(response, "musicResponsiveHeaderRenderer")[1]
+        ?? P.collect(response, "musicDetailHeaderRenderer")[1]
+        ?? P.collect(response, "musicEditablePlaylistDetailHeaderRenderer")[1]
+    if not header then return {} end
+    local inner = P.get(header, "header", "musicDetailHeaderRenderer") ?? P.get(header, "header", "musicResponsiveHeaderRenderer")
+    if inner then header = inner end
+    local sub = P.subtitle(P.runs(header.subtitle), { skipLabel = true })
+    local strap = P.subtitle(P.runs(header.straplineTextOne))
+    local artists = (#strap.artists > 0) and strap.artists or sub.artists
+    local description = P.collect(header, "musicDescriptionShelfRenderer")[1]
+    -- Playlists name their owner in an avatar stack ("facepile").
+    local owner = nil
+    local stack = P.get(header, "facepile", "avatarStackViewModel")
+    if stack then
+        local name = P.get(stack, "text", "content") ?? P.get(stack, "rendererContext", "accessibilityContext", "label")
+        local e = P.endpoint(P.get(stack, "rendererContext", "commandContext", "onTap", "innertubeCommand"))
+        if name then owner = { name = name, id = e and e.browseId } end
+    end
+    return {
+        owner = owner,
+        title = P.text(header.title) ?? "",
+        subtitle = P.text(header.subtitle),
+        secondSubtitle = P.text(header.secondSubtitle),
+        artists = artists,
+        year = sub.year,
+        description = P.text(description and description.description) ?? P.text(header.description),
+        thumbnails = P.thumbnails(header.thumbnail),
+    }
+end
+
+-- { kind, title, subtitle, secondSubtitle, artists, year, description,
+--   thumbnails, playlistId?, tracks, continuation?, related = { shelf... } }
+-- Album tracks inherit the album's artists when their rows leave them out.
+function pages.collection(response: table, kind: string?): table
+    local out = collectionHeader(response)
+    out.kind = kind
+    out.tracks = {}
+    out.related = {}
+    local list = sectionList(response)
+    for _, wrapper in (list and list.contents) ?? {} do
+        local playlistShelf = wrapper.musicPlaylistShelfRenderer
+        local plain = wrapper.musicShelfRenderer
+        local body = playlistShelf ?? plain
+        if body then
+            for _, item in P.items(body.contents) do table.insert(out.tracks, item) end
+            out.continuation = out.continuation ?? P.continuation(body)
+            out.playlistId = out.playlistId ?? body.playlistId
+        else
+            local s = shelf(wrapper)
+            if s and #s.items > 0 then table.insert(out.related, s) end
+        end
+    end
+    if not out.playlistId then
+        local canonical = P.get(response, "microformat", "microformatDataRenderer", "urlCanonical")
+        if type(canonical) == "string" then out.playlistId = string.match(canonical, "list=([%w_%-]+)") end
+    end
+    for _, track in out.tracks do
+        if #track.artists == 0 and out.artists then track.artists = out.artists end
+        if kind == "album" and not track.album then track.album = { name = out.title, id = nil } end
+    end
+    return out
+end
+
+-- A continuation page of a collection's track list.
+function pages.collectionMore(response: table): ({table}, string?)
+    return P.continuationItems(response)
+end
+
+-- ARTIST -----------------------------------------------------------------------
+
+-- { name, description, thumbnails, subscribers, channelId, subscribed,
+--   monthly, play?, radio?, shelves = { shelf... }, about? }
+function pages.artist(response: table): table
+    local header = P.get(response, "header", "musicImmersiveHeaderRenderer")
+        ?? P.get(response, "header", "musicVisualHeaderRenderer")
+        ?? P.get(response, "header", "musicHeaderRenderer") ?? {}
+    local subscribe = P.collect(header, "subscribeButtonRenderer")[1] ?? {}
+    local out = {
+        name = P.text(header.title) ?? "",
+        description = P.text(header.description),
+        thumbnails = P.thumbnails(header.thumbnail),
+        subscribers = P.text(subscribe.subscriberCountText) ?? P.text(subscribe.longSubscriberCountText),
+        channelId = subscribe.channelId,
+        subscribed = subscribe.subscribed == true,
+        monthly = P.text(header.monthlyListenerCount),
+        play = P.endpoint(P.get(header, "playButton", "buttonRenderer", "navigationEndpoint")),
+        radio = P.endpoint(P.get(header, "startRadioButton", "buttonRenderer", "navigationEndpoint")),
+        shelves = {},
+    }
+    local list = sectionList(response)
+    for _, wrapper in (list and list.contents) ?? {} do
+        local s = shelf(wrapper)
+        if s and #s.items > 0 then
+            table.insert(out.shelves, s)
+        elseif wrapper.musicDescriptionShelfRenderer then
+            out.about = P.text(wrapper.musicDescriptionShelfRenderer.description)
+        end
+    end
+    -- Albums and singles on an artist page only show the year: they are the artist's.
+    local self = { { name = out.name, id = out.channelId } }
+    for _, s in out.shelves do
+        for _, item in s.items do
+            if item.kind == "album" and #item.artists == 0 then item.artists = self end
+        end
+    end
+    return out
+end
+
+-- LIBRARY ----------------------------------------------------------------------
+
+-- A library page (playlists, albums, artists, songs): { items, continuation? }.
+-- Library artist rows link to "MPLA<channel id>" pages; `artistId` holds the
+-- channel id for the regular artist page.
+function pages.library(response: table): table
+    local out = { items = {}, continuation = nil }
+    local list = sectionList(response)
+    if not list then
+        out.items, out.continuation = P.continuationItems(response)
+        return out
+    end
+    for _, wrapper in list.contents ?? {} do
+        local body = wrapper.gridRenderer ?? wrapper.musicShelfRenderer
+        if body then
+            for _, item in P.items(body.items ?? body.contents) do table.insert(out.items, item) end
+            out.continuation = out.continuation ?? P.continuation(body)
+        end
+    end
+    for _, item in out.items do
+        local id = item.browseId
+        if id and string.sub(id, 1, 4) == "MPLA" then
+            item.kind = "artist"
+            item.artistId = string.sub(id, 5)
+        end
+    end
+    return out
+end
+
+-- WATCH (`next`) ------------------------------------------------------------------
+
+-- { queue = { item... }, current = index?, playlistId?, lyrics?, related?,
+--   continuation? }. Tabs are found by page type, not by their (localized) titles.
+function pages.watch(response: table): table
+    local out = { queue = {}, current = nil }
+    for _, tab in P.collect(response, "tabRenderer") do
+        local e = P.endpoint(tab.endpoint)
+        if e and e.pageType == "MUSIC_PAGE_TYPE_TRACK_LYRICS" then out.lyrics = e.browseId end
+        if e and e.pageType == "MUSIC_PAGE_TYPE_TRACK_RELATED" then out.related = e.browseId end
+    end
+    local panel = P.collect(response, "playlistPanelRenderer")[1]
+    if panel then
+        out.queue = P.items(panel.contents)
+        out.playlistId = panel.playlistId
+        out.continuation = P.continuation(panel)
+        for i, item in out.queue do
+            if item.selected then out.current = i end
+        end
+    end
+    return out
+end
+
+-- LYRICS -----------------------------------------------------------------------
+
+-- { text, source? } or nil when the track has no lyrics.
+function pages.lyrics(response: table): table?
+    local body = P.collect(response, "musicDescriptionShelfRenderer")[1]
+    if not body then return nil end
+    local text = P.text(body.description)
+    if not text or text == "" then return nil end
+    return { text = text, source = P.text(body.footer) }
+end
+
+-- ACCOUNTS -----------------------------------------------------------------------
+
+-- { { name, byline?, handle?, photo?, pageId?, hasChannel, selected, signinUrl? } }
+-- `pageId` is nil for the Google account itself (the owner). Switching uses
+-- `signinUrl` (see SPEC.md 11.1).
+function pages.accounts(response: table): {table}
+    local out = {}
+    for _, item in P.collect(response, "accountItem") do
+        local name = P.text(item.accountName)
+        if name then
+            local pageId = nil
+            for _, token in P.collect(item.serviceEndpoint, "pageIdToken") do pageId = pageId ?? token.pageId end
+            local signin = nil
+            for _, token in P.collect(item.serviceEndpoint, "accountSigninToken") do signin = signin ?? token.signinUrl end
+            table.insert(out, {
+                name = name,
+                byline = P.text(item.accountByline),
+                handle = P.text(item.channelHandle),
+                photo = P.thumbnails(item.accountPhoto),
+                pageId = pageId,
+                hasChannel = item.hasChannel == true,
+                selected = item.isSelected == true,
+                signinUrl = signin,
+            })
+        end
+    end
+    return out
+end
+
+return pages

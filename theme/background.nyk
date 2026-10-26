@@ -1,0 +1,139 @@
+-- The window background: a default gradient, a flat color, a custom gradient,
+-- or an image / animated GIF / animated WebP chosen by the user. Images are
+-- resized to cover the window and blurred once per window size (every frame of
+-- an animation), so drawing them each frame is a plain cached blit.
+
+local ui = require("@neyuki/ui")
+local fs = require("@neyuki/fs")
+
+local background = {}
+
+local source = nil     -- decoded user image
+local prepared = nil   -- cover-sized, blurred copy for the current window
+local preparedKey = nil
+local animation = nil
+local loadError = nil
+
+-- (Re)loads the image named by the settings. Errors are kept so the shell can
+-- show them, and the default background is used meanwhile.
+function background.reload(cfg: table)
+    if source then source:close() end
+    if prepared and prepared ~= source then prepared:close() end
+    source, prepared, preparedKey, animation, loadError = nil, nil, nil, nil, nil
+    if cfg.kind == "image" and cfg.path then
+        if not fs.exists(cfg.path) then
+            loadError = "background file is missing"
+            return
+        end
+        local ok, image = pcall(ui.loadImage, cfg.path, { maxBytes = 768 * 1024 * 1024 })
+        if ok then
+            source = image
+            if image.frames > 1 then animation = ui.animation(image, { loop = true }) end
+        else
+            loadError = tostring(image)
+        end
+    end
+end
+
+function background.error(): string?
+    return loadError
+end
+
+local settle = 0   -- seconds the requested size has been stable
+
+-- A copy of the source that covers w x h physical pixels and is blurred.
+-- While the window is being resized the previous copy keeps being drawn
+-- (scaled to cover); the new one is made once the size has settled.
+local function prepare(w: number, h: number, scale: number, blur: number, dt: number)
+    local pw, ph = math.ceil(w * scale), math.ceil(h * scale)
+    local key = `{pw}x{ph}@{blur}`
+    if key == preparedKey then
+        settle = 0
+        return
+    end
+    settle += dt
+    if prepared and settle < 0.2 then return end
+    settle = 0
+    if prepared and prepared ~= source then prepared:close() end
+    local cover = math.max(pw / source.width, ph / source.height)
+    -- Never upscale before blurring: a blurred image hides the softness, and
+    -- the blur is cheaper on fewer pixels.
+    local factor = math.min(cover, 1)
+    local image = source
+    if factor < 1 then
+        image = source:resized(math.max(1, math.round(source.width * factor)), math.max(1, math.round(source.height * factor)))
+    end
+    if blur > 0 then
+        local blurred = image:blur(blur * scale * factor)
+        if image ~= source then image:close() end
+        image = blurred
+    end
+    prepared, preparedKey = image, key
+end
+
+-- Paints one frame of the background onto `target`.
+local function paint(target: any, w: number, h: number, cfg: table, frame: number)
+    if source and prepared then
+        target:drawImage(prepared, 0, 0, { width = w, height = h, fit = "cover", frame = frame })
+    elseif cfg.kind == "color" then
+        target:clear(cfg.color ?? "#101014")
+    elseif cfg.kind == "gradient" then
+        local g = cfg.gradient ?? {}
+        target:fillRect(0, 0, w, h, "#000000", { gradient = { from = g.from, to = g.to, angle = g.angle ?? 135 } })
+    else
+        -- Default: deep charcoal with two soft, desaturated glows.
+        target:clear("#0d0d10")
+        target:fillRect(0, 0, w, h, "#000000", { gradient = {
+            kind = "radial", center = { x = w * 0.82, y = h * 0.18 }, radius = math.max(w, h) * 0.75,
+            stops = { { 0, "#3b2a5a" }, { 0.55, "#1a1626" }, { 1, "#0d0d1000" } },
+        } })
+        target:fillRect(0, 0, w, h, "#000000", { gradient = {
+            kind = "radial", center = { x = w * 0.12, y = h * 0.95 }, radius = math.max(w, h) * 0.6,
+            stops = { { 0, "#163238aa" }, { 1, "#0d0d1000" } },
+        } })
+    end
+    local dim = cfg.dim ?? 0
+    if source and dim > 0 then
+        target:fillRect(0, 0, w, h, { r = 0, g = 0, b = 0, a = math.floor(255 * math.clamp(dim, 0, 0.95)) })
+    end
+end
+
+local cache = nil      -- canvas holding a still background at the window size
+local cacheKey = nil
+
+-- Draws the background over the whole surface. Still backgrounds are painted
+-- once per size and settings into a canvas and blitted afterwards; animated
+-- ones are painted every frame. Returns true while frames keep changing.
+function background.draw(target: any, w: number, h: number, dt: number, cfg: table): boolean
+    local scale = target:scale()
+    if source then prepare(w, h, scale, cfg.blur ?? 0, dt) end
+    if source and animation and cfg.animate ~= false then
+        paint(target, w, h, cfg, animation:update(dt))
+        return true
+    end
+    local g = cfg.gradient ?? {}
+    local key = `{w}x{h}@{scale}|{cfg.kind}|{cfg.color}|{g.from}|{g.to}|{g.angle}|{cfg.dim}|{preparedKey}`
+    if key ~= cacheKey then
+        if cache then cache:close() end
+        cache = ui.canvas(w, h, { scale = scale })
+        paint(cache, w, h, cfg, 1)
+        cacheKey = key
+    end
+    target:drawImage(cache, 0, 0)
+    return source ~= nil and settle > 0
+end
+
+-- Copies a dropped file into the data directory and points the settings at it.
+-- Returns the new path, or nil and a reason.
+function background.adopt(path: string): (string?, string?)
+    local ext = string.lower(fs.extension(path) ?? "")
+    local allowed = { [".png"] = true, [".jpg"] = true, [".jpeg"] = true, [".gif"] = true, [".webp"] = true, [".bmp"] = true }
+    if not allowed[ext] then return nil, `not an image ({ext})` end
+    local dir = fs.join(os.dataDir("shirabe"), "backgrounds")
+    fs.mkdir(dir, true)
+    local target = fs.join(dir, "background" .. ext)
+    fs.copy(path, target)
+    return target, nil
+end
+
+return background

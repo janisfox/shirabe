@@ -1,0 +1,267 @@
+-- Media components shared by the pages: artwork (with placeholder and
+-- fade-in), cards, track rows and horizontally scrolling carousels.
+-- They act through `ctx.open(item)` (go to its page, or play it if it is a
+-- track) and `ctx.play(item, context?)`.
+
+local ui = require("@neyuki/ui")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local tokens = require("theme/tokens")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+local images = require("services/images")
+
+local C = tokens.color
+local media = {}
+
+local PLAYABLE = { song = true, video = true, episode = true, album = true, playlist = true, podcast = true }
+local TRACK = { song = true, video = true, episode = true }
+
+function media.isTrack(item: table): boolean
+    return TRACK[item.kind ?? ""] == true
+end
+
+function media.artists(item: table): string?
+    local names = {}
+    for _, a in item.artists ?? {} do table.insert(names, a.name) end
+    if #names == 0 then return nil end
+    return table.concat(names, ", ")
+end
+
+-- The second line under a title: artists, else the first other piece.
+function media.byline(item: table): string
+    local artists = media.artists(item)
+    local extras = item.extras ?? {}
+    if item.kind == "album" and item.year then
+        return artists and `{artists} • {item.year}` or tostring(item.year)
+    end
+    if artists then
+        if item.kind == "video" and extras[1] then return `{artists} • {extras[1]}` end
+        return artists
+    end
+    return extras[1] ?? item.subtitle ?? ""
+end
+
+local PLACEHOLDER_ICONS = { artist = "home", user = "home", album = "library", playlist = "queue", song = "lyrics", video = "play" }
+
+-- Artwork for `thumbnails` in a box; round for artists. Fades in once loaded.
+function media.art(win: any, thumbnails: {table}?, x: number, y: number, w: number, h: number, options: table?)
+    local o = options ?? {}
+    local radius = o.round and math.min(w, h) / 2 or (o.radius ?? 6)
+    local image, fade = images.get(thumbnails, math.max(w, h) * win:scale())
+    if not image or fade < 1 then
+        win:fillRect(x, y, w, h, 0xFFFFFF12, { radius = radius })
+        if not image then
+            local s = math.min(w, h) * 0.32
+            icons.draw(win, PLACEHOLDER_ICONS[o.kind ?? ""] ?? "lyrics", x + (w - s) / 2, y + (h - s) / 2, s, C.textFaint)
+        end
+    end
+    if image then
+        win:drawImage(image, x, y, { width = w, height = h, fit = "cover", radius = radius, opacity = fade })
+    end
+end
+
+-- A round play button that rises in on hover. Returns its hit state.
+local function playButton(win: any, id: string, cx: number, cy: number, hv: number, r: number?): table
+    local radius = r ?? 19
+    local st = input.hit(id, cx - radius, cy - radius, radius * 2, radius * 2)
+    local hover = anim.follow(`{id}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
+    local scale = 1 + hover * 0.06
+    local alpha = math.floor(255 * hv)
+    win:circle(cx, cy, radius * scale, { r = 0xF2, g = 0xF2, b = 0xF0, a = alpha },
+        { shadow = { blur = 12, offsetY = 4, color = { r = 0, g = 0, b = 0, a = math.floor(0x66 * hv) } } })
+    local s = radius * 0.95
+    icons.draw(win, "play", cx - s / 2 + 1, cy - s / 2, s, { r = 0x11, g = 0x11, b = 0x13, a = alpha })
+    return st
+end
+
+-- A card: artwork (square, or 16:9 for videos), title and byline. Returns its
+-- height. `w` is the card width.
+function media.card(win: any, id: string, item: table, x: number, y: number, w: number, ctx: table): number
+    local wide = item.aspect == "wide"
+    local artH = wide and math.floor(w * 9 / 16) or w
+    local h = artH + 50
+    local st = input.hit(id, x, y, w, h)
+    local hv = anim.follow(`{id}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
+    local round = item.kind == "artist" or item.kind == "user"
+    local lift = hv * 3
+    media.art(win, item.thumbnails, x, y - lift, w, artH, { round = round, radius = tokens.radius.card, kind = item.kind })
+    local played = false
+    if PLAYABLE[item.kind ?? ""] and hv > 0.01 then
+        local pb = playButton(win, `{id}:play`, x + w - 28, y + artH - 28 - lift + (1 - hv) * 8, hv)
+        if pb.click then
+            ctx.play(item)
+            played = true
+        end
+    end
+    local align = round and "center" or "left"
+    win:text(x, y + artH + 9, item.title, { size = 13.5, font = fonts.semibold, color = C.text,
+        maxWidth = w, overflow = "ellipsis", align = align })
+    win:text(x, y + artH + 28, media.byline(item), { size = 12, font = fonts.regular, color = C.textDim,
+        maxWidth = w, overflow = "ellipsis", align = align })
+    if st.click and not played then ctx.open(item) end
+    return h
+end
+
+local function clock(seconds: number?): string
+    if not seconds then return "" end
+    local s = math.floor(seconds)
+    if s >= 3600 then return string.format("%d:%02d:%02d", s // 3600, (s % 3600) // 60, s % 60) end
+    return string.format("%d:%02d", s // 60, s % 60)
+end
+media.clock = clock
+
+-- A track row: index or artwork, title / artists, album, duration. Clicking
+-- plays it (in `context`, the album / playlist it belongs to); `options`:
+-- index (show this number instead of art), showAlbum, playing (highlight),
+-- context ({ playlistId } to play the row inside).
+function media.row(win: any, id: string, item: table, x: number, y: number, w: number, ctx: table, options: table?): number
+    local o = options ?? {}
+    local h = 56
+    local st = input.hit(id, x - 8, y, w + 16, h)
+    local hv = anim.follow(`{id}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
+    if hv > 0.01 or o.playing then
+        win:fillRect(x - 8, y, w + 16, h, ui.mixColor(0xFFFFFF00, C.hover, math.max(hv, o.playing and 0.6 or 0)), { radius = 8 })
+    end
+    local cx = x
+    if o.index then
+        if hv > 0.5 then
+            icons.draw(win, "play", cx + 4, y + (h - 16) / 2, 16, C.text)
+        else
+            win:text(cx + 12, y + (h - 18) / 2, tostring(o.index), { size = 13.5, font = fonts.medium,
+                color = o.playing and C.text or C.textDim, align = "center" })
+        end
+        cx += 34
+    else
+        media.art(win, item.thumbnails, cx, y + 8, 40, 40, { radius = 5, kind = item.kind, round = item.kind == "artist" })
+        cx += 54
+    end
+    local durationW = 56
+    local albumW = (o.showAlbum and w > 640) and math.floor((w - (cx - x) - durationW) * 0.35) or 0
+    local textW = w - (cx - x) - durationW - albumW - 12
+    local dim = item.unavailable and 0.4 or 1
+    win:text(cx, y + 9, item.title, { size = 14, font = fonts.medium, color = C.text, maxWidth = textW,
+        overflow = "ellipsis", opacity = dim })
+    local sub = media.byline(item)
+    if item.explicit then sub = "E  " .. sub end
+    win:text(cx, y + 30, sub, { size = 12.5, font = fonts.regular, color = C.textDim, maxWidth = textW,
+        overflow = "ellipsis", opacity = dim })
+    if albumW > 0 and item.album then
+        win:text(cx + textW + 12, y + (h - 18) / 2, item.album.name, { size = 13, font = fonts.regular,
+            color = C.textDim, maxWidth = albumW - 12, overflow = "ellipsis" })
+    end
+    win:text(x + w, y + (h - 18) / 2, item.durationText ?? clock(item.duration), { size = 13, font = fonts.regular,
+        color = C.textDim, align = "right" })
+    if st.click then
+        if media.isTrack(item) then ctx.play(item, o.context) else ctx.open(item) end
+    end
+    return h
+end
+
+-- A shelf shown as a horizontally scrolling row of cards, with a header and
+-- arrow buttons while hovered. Returns the height used.
+function media.carousel(win: any, id: string, shelf: table, x: number, y: number, w: number, ctx: table, options: table?): number
+    local o = options ?? {}
+    local cardW = o.cardW ?? 172
+    local gap = 18
+    local headerH = 34
+    local title = shelf.title ?? ""
+    if shelf.strapline then
+        win:text(x, y - 16, string.upper(shelf.strapline), { size = 11, font = fonts.semibold, color = C.textFaint, letterSpacing = 0.6 })
+    end
+    win:text(x, y, title, { size = 19, font = fonts.bold, color = C.text, maxWidth = w - 120, overflow = "ellipsis" })
+
+    -- Rows of tracks in a carousel (quick picks) are laid out as a grid of rows.
+    local allTracks = #shelf.items > 0
+    for _, item in shelf.items do
+        if not (media.isTrack(item) and item.aspect == nil) then allTracks = false end
+    end
+    if allTracks then
+        local cols = (w > 900) and 3 or 2
+        local colW = (w - gap * (cols - 1)) / cols
+        local rows = math.min(4, math.ceil(#shelf.items / cols))
+        for i, item in shelf.items do
+            if i > cols * rows then break end
+            local col = (i - 1) // rows
+            local row = (i - 1) % rows
+            media.row(win, `{id}:{i}`, item, x + col * (colW + gap), y + headerH + row * 56, colW, ctx)
+        end
+        return headerH + rows * 56 + 30
+    end
+
+    local wide = false
+    for _, item in shelf.items do
+        if item.aspect == "wide" then wide = true end
+    end
+    local cw = wide and math.floor(cardW * 1.55) or cardW
+    local total = #shelf.items * (cw + gap) - gap
+    local maxOffset = math.max(0, total - w)
+    local key = `{id}:offset`
+    local target = anim.get(`{key}:target`) ?? 0
+    local areaH = (wide and math.floor(cw * 9 / 16) or cw) + 50
+    local hover = input.inside and input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + headerH + areaH
+    if hover and input.scrollX ~= 0 then
+        target -= input.scrollX
+        input.scrollTaken = true
+    end
+
+    -- Arrow buttons in the header.
+    if maxOffset > 0 then
+        local page = w * 0.8
+        local leftSt = input.hit(`{id}:left`, x + w - 68, y - 4, 30, 30)
+        local rightSt = input.hit(`{id}:right`, x + w - 32, y - 4, 30, 30)
+        for _, b in { { st = leftSt, x = x + w - 68, icon = "prev", enabled = target > 0 },
+                      { st = rightSt, x = x + w - 32, icon = "next", enabled = target < maxOffset } } do
+            local bg = b.st.hover and C.surfaceHover or C.surface
+            win:circle(b.x + 15, y + 11, 15, bg)
+            icons.draw(win, b.icon, b.x + 8, y + 4, 14, b.enabled and C.text or C.textFaint)
+        end
+        if leftSt.click then target -= page end
+        if rightSt.click then target += page end
+    end
+    target = math.clamp(target, 0, maxOffset)
+    anim.set(`{key}:target`, target)
+    local offset = anim.follow(key, target, 14, 0)
+
+    local top = y + headerH
+    win:pushClip(x - 6, top - 8, w + 12, areaH + 12)
+    for i, item in shelf.items do
+        local cx = x + (i - 1) * (cw + gap) - offset
+        if cx + cw >= x - 10 and cx <= x + w + 10 then
+            media.card(win, `{id}:{i}`, item, cx, top, cw, ctx)
+        end
+    end
+    win:popClip()
+    return headerH + areaH + 34
+end
+
+-- A wrapping grid of cards. Returns the height used.
+function media.grid(win: any, id: string, items: {table}, x: number, y: number, w: number, ctx: table, options: table?): number
+    local o = options ?? {}
+    local size = o.cardW ?? 176
+    local gap = 22
+    local perRow = math.max(1, math.floor((w + gap) / (size + gap)))
+    local cw = math.floor((w - gap * (perRow - 1)) / perRow)
+    local rowH = cw + 50 + 18
+    for i, item in items do
+        local col = (i - 1) % perRow
+        local row = (i - 1) // perRow
+        local cy = y + row * rowH
+        if cy + rowH >= (o.viewTop ?? -math.huge) and cy <= (o.viewBottom ?? math.huge) then
+            media.card(win, `{id}:{i}`, item, x + col * (cw + gap), cy, cw, ctx)
+        end
+    end
+    return math.ceil(#items / perRow) * rowH
+end
+
+-- A small spinner (three pulsing dots) centered in a box.
+function media.spinner(win: any, cx: number, cy: number)
+    local t = os.clock()
+    for i = 0, 2 do
+        local a = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 6 - i * 0.9))
+        win:circle(cx - 12 + i * 12, cy, 3.5, { r = 0xF2, g = 0xF2, b = 0xF0, a = math.floor(255 * a) })
+    end
+    anim.busy = true
+end
+
+return media

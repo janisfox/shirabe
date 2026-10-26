@@ -1,0 +1,20 @@
+# Milestone 4: artist and collection pages (run muted).
+wait 8
+key k ctrl
+wait 0.4
+type STOMACH BOOK
+key enter
+wait 5
+click 400 300
+wait 6
+snap p1-artist
+scroll 640 420 -900
+wait 1.2
+snap p2-artist-scrolled
+key arrowleft
+key 3 ctrl
+wait 5
+click 172 230
+wait 6
+snap p3-collection
+quit

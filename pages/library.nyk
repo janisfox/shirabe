@@ -1,0 +1,136 @@
+-- Library: the account's playlists, albums, artists and liked songs, synced
+-- with YouTube Music. Chips pick a section (with a sliding selection), the
+-- field filters what is loaded, grid / list switch the layout.
+
+local ui = require("@neyuki/ui")
+local common = require("pages/common")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local loader = require("state/loader")
+local api = require("services/ytm/api")
+local tokens = require("theme/tokens")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local library = {}
+
+local CHIPS = {
+    { label = "Playlists", kind = "playlists" },
+    { label = "Albums", kind = "albums" },
+    { label = "Artists", kind = "artists" },
+    { label = "Songs", kind = "songs" },
+}
+local chip = 1
+local view = "grid"
+
+-- Chips sharing one light pill that slides to the selected one.
+local function chips(win: any, x: number, y: number): number
+    local h = 32
+    local positions = {}
+    local cx = x
+    for i, c in CHIPS do
+        local tw = ui.measureText(c.label, { size = 13.5, font = fonts.semibold })
+        positions[i] = { x = cx, w = tw + 28 }
+        cx += tw + 28 + 8
+    end
+    local sel = positions[chip]
+    local px = anim.follow("library:chip:x", sel.x, tokens.motion.pillRate)
+    local pw = anim.follow("library:chip:w", sel.w, tokens.motion.pillRate)
+    for i, pos in positions do
+        if i ~= chip then
+            local st = input.hit(`library:chip:{i}`, pos.x, y, pos.w, h)
+            local hv = anim.follow(`library:chip:{i}:hover`, (st.hover and 1 or 0), tokens.motion.hoverRate)
+            win:fillRect(pos.x, y, pos.w, h, ui.mixColor(C.surface, C.surfaceHover, hv), { radius = tokens.radius.chip })
+            if st.click then
+                chip = i
+                require("app/router").scrollTop()
+            end
+        end
+    end
+    win:fillRect(px, y, pw, h, C.surfaceActive, { radius = tokens.radius.chip })
+    for i, pos in positions do
+        -- Text color follows how much of the moving pill covers the chip.
+        local cover = math.clamp(1 - math.abs((px + pw / 2) - (pos.x + pos.w / 2)) / (pos.w * 0.75), 0, 1)
+        win:text(pos.x + pos.w / 2, y + 7, CHIPS[i].label, { size = 13.5, font = fonts.semibold, align = "center",
+            color = ui.mixColor(C.text, C.textOnActive, cover) })
+    end
+    return cx
+end
+
+-- Loads a section and all its continuation pages (libraries are small).
+local function section(kind: string): (table, {table})
+    local first = loader.get(`library:{kind}`, function() return api.library(kind) end)
+    local items = {}
+    if first.status ~= "ready" then return first, items end
+    for _, item in first.value.items do table.insert(items, item) end
+    local token = first.value.continuation
+    local n = 1
+    while token do
+        local t = token
+        local more = loader.get(`library:{kind}:more:{n}`, function() return api.libraryMore(t) end)
+        if more.status ~= "ready" then break end
+        for _, item in more.value.items do table.insert(items, item) end
+        token = more.value.continuation
+        n += 1
+    end
+    return first, items
+end
+
+local function matches(item: table, filter: string): boolean
+    if filter == "" then return true end
+    local hay = string.lower(item.title .. " " .. (media.artists(item) ?? ""))
+    return string.find(hay, string.lower(filter), 1, true) ~= nil
+end
+
+function library.draw(win: any, R: table, ctx: table): number
+    local y = common.header(win, R, "Library")
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+
+    chips(win, x, y)
+    local rx = x + w
+    if widgets.iconButton(win, "library:list", "list", rx - 32, y, 32, { active = view == "list", iconSize = 16 }).click then view = "list" end
+    rx -= 36
+    if widgets.iconButton(win, "library:grid", "grid", rx - 32, y, 32, { active = view == "grid", iconSize = 14 }).click then view = "grid" end
+    rx -= 40
+    local fieldW = math.min(220, rx - (x + 420))
+    if fieldW > 120 then
+        widgets.textField(win, "library:filter", rx - fieldW, y, fieldW, 32,
+            { placeholder = "Search library", icon = "search", win = ctx.win })
+    end
+    y += 32 + 18
+
+    local kind = CHIPS[chip].kind
+    local entry, all = section(kind)
+    ctx.retry = function() loader.forgetPrefix(`library:{kind}`) end
+    local stop, below = common.state(win, R, y, ctx, entry)
+    if stop then return below - R.y + 40 end
+
+    local filter = widgets.fieldText("library:filter")
+    local items = {}
+    for _, item in all do
+        if matches(item, filter) then table.insert(items, item) end
+    end
+    if #items == 0 then
+        local message = (filter ~= "") and `Nothing in your library matches “{filter}”.`
+            or "Nothing here yet. What you save on YouTube Music shows up here."
+        win:text(x, y + 10, message, { size = 13.5, font = fonts.regular, color = C.textDim })
+        return (y + 60) - R.y
+    end
+
+    if kind == "songs" or view == "list" then
+        for i, item in items do
+            if common.visible(R, y, 56) then
+                media.row(win, `library:{kind}:{i}`, item, x, y, w, ctx, { showAlbum = kind == "songs" })
+            end
+            y += 56
+        end
+    else
+        y += media.grid(win, `library:{kind}`, items, x, y, w, ctx, { viewTop = R.viewTop - 300, viewBottom = R.viewBottom + 300 })
+    end
+    return (y + 30) - R.y
+end
+
+return library

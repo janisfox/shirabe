@@ -1,0 +1,7 @@
+# Recorded YouTube Music responses: personal data (see tests/fixtures/ytm/README.md).
+tests/fixtures/ytm/*
+!tests/fixtures/ytm/README.md
+
+# Development snapshots and scratch output.
+*.ppm
+snap/

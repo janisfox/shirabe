@@ -1,0 +1,28 @@
+-- Development aid: writes what the window has drawn to a plain-text PPM (P3)
+-- image, so the UI can be reviewed without a screen capture tool. Text,
+-- because Neyuki strings are UTF-8 and cannot carry raw image bytes.
+-- `python dev/ppm2png.py <file.ppm>` turns it into a PNG.
+
+local fs = require("@neyuki/fs")
+
+local snapshot = {}
+
+function snapshot.write(win: any, path: string)
+    local w, h = win:size()
+    w, h = math.floor(w), math.floor(h)
+    local out = fs.open(path, "w")
+    out:write(`P3\n{w} {h}\n255\n`)
+    for y = 0, h - 1 do
+        local row = table.create and table.create(w * 3) or {}
+        local n = 0
+        for x = 0, w - 1 do
+            local r, g, b = win:getPixel(x + 0.5, y + 0.5)
+            row[n + 1], row[n + 2], row[n + 3] = r, g, b
+            n += 3
+        end
+        out:write(table.concat(row, " ") .. "\n")
+    end
+    out:close()
+end
+
+return snapshot

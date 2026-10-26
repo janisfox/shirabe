@@ -1,0 +1,43 @@
+-- Frame-rate independent smoothing for hover highlights, sliding pills and
+-- scroll positions. `anim.follow(key, target, rate)` moves a stored value
+-- toward `target` (exponential approach at `rate` per second) and returns it.
+-- `anim.busy` tells the loop that something is still moving, so `ui.run`
+-- with `fps = "auto"` keeps drawing until everything has settled.
+
+local anim = {}
+
+local values = {}
+anim.dt = 0
+anim.busy = false
+
+function anim.begin(dt: number)
+    anim.dt = math.min(dt, 0.1)   -- a long stall must not teleport everything
+    anim.busy = false
+end
+
+function anim.follow(key: any, target: number, rate: number, initial: number?): number
+    local current = values[key]
+    if current == nil then
+        current = initial ?? target
+    end
+    local t = 1 - math.exp(-rate * anim.dt)
+    local value = current + (target - current) * t
+    if math.abs(target - value) < 0.001 then
+        value = target
+    else
+        anim.busy = true
+    end
+    values[key] = value
+    return value
+end
+
+-- Sets a value without animating (e.g. after a resize).
+function anim.set(key: any, value: number)
+    values[key] = value
+end
+
+function anim.get(key: any): number?
+    return values[key]
+end
+
+return anim

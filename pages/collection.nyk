@@ -1,0 +1,123 @@
+-- An album or a playlist (Liked Music included): header with artwork, title,
+-- details and Play / Shuffle, then the tracks (more load as you scroll).
+-- params: { kind = "album" | "playlist", id = browse id / playlist id, title? }
+
+local common = require("pages/common")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local loader = require("state/loader")
+local api = require("services/ytm/api")
+local player = require("state/player")
+local tokens = require("theme/tokens")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local collection = {}
+
+function collection.key(params: table): string
+    return params.id
+end
+
+local function load(params: table): table
+    local id = params.id
+    if params.kind == "album" then
+        return loader.get(`album:{id}`, function() return api.album(id) end)
+    end
+    return loader.get(`playlist:{id}`, function() return api.playlist(id) end)
+end
+
+function collection.draw(win: any, R: table, ctx: table, params: table): number
+    local x = R.x + common.PAD
+    local w = R.w - common.PAD * 2
+    local y = R.y + common.TOP
+    local entry = load(params)
+    ctx.retry = function() loader.forget(`{params.kind}:{params.id}`) end
+    local stop, below = common.state(win, R, y, ctx, entry)
+    if stop then return below - R.y + 40 end
+    local c = entry.value
+
+    -- Header.
+    local art = math.min(208, math.max(140, w * 0.22))
+    media.art(win, c.thumbnails, x, y, art, art, { radius = 10, kind = params.kind })
+    local tx = x + art + 26
+    local tw = w - art - 26
+    win:text(tx, y + 6, string.upper(params.kind == "album" and (c.subtitle ?? "Album") or (c.subtitle ?? "Playlist")),
+        { size = 11.5, font = fonts.semibold, color = C.textDim, letterSpacing = 0.5, maxWidth = tw, overflow = "ellipsis" })
+    local _, th = win:text(tx, y + 26, c.title, { size = 30, font = fonts.display, color = C.text, maxWidth = tw,
+        overflow = "ellipsis" })
+    local by = media.artists(c) ?? (c.owner and c.owner.name)
+    local line = y + 26 + th + 8
+    if by then
+        win:text(tx, line, by, { size = 14.5, font = fonts.semibold, color = C.text, maxWidth = tw, overflow = "ellipsis" })
+        line += 24
+    end
+    if c.secondSubtitle then
+        win:text(tx, line, c.secondSubtitle, { size = 13, font = fonts.regular, color = C.textDim })
+        line += 22
+    end
+    local by2 = y + art - 38
+    local playing = player.context and player.context == (c.playlistId ?? params.id)
+    local st, pw = widgets.pill(win, "collection:play", (playing and player.playing) and "Playing" or "Play", tx, by2,
+        { primary = true, icon = "play", height = 38 })
+    if st.click and #c.tracks > 0 then ctx.play(c.tracks[1], { playlistId = c.playlistId, index = 1 }) end
+    local sst = widgets.pill(win, "collection:shuffle", "Shuffle", tx + pw + 10, by2, { icon = "shuffle", height = 38 })
+    if sst.click and #c.tracks > 0 then
+        local pick = c.tracks[math.random(1, #c.tracks)]
+        ctx.play(pick, { playlistId = c.playlistId, shuffle = true })
+    end
+    y += art + 28
+
+    if c.description and c.description ~= "" and common.visible(R, y, 60) then
+        win:text(x, y, c.description, { size = 13, font = fonts.regular, color = C.textDim, maxWidth = math.min(w, 860),
+            overflow = "ellipsis", lineHeight = 1.35 })
+        y += 30
+    end
+
+    -- Tracks, then their continuation pages.
+    local tracks = {}
+    for _, t in c.tracks do table.insert(tracks, t) end
+    local token = c.continuation
+    local n = 1
+    while token do
+        local more = loader.peek(`{params.kind}:{params.id}:more:{n}`)
+        if not more or more.status ~= "ready" then break end
+        for _, t in more.value[1] ?? more.value do table.insert(tracks, t) end
+        token = more.value[2]
+        n += 1
+    end
+    local album = params.kind == "album"
+    for i, track in tracks do
+        if common.visible(R, y, 56) then
+            media.row(win, `collection:{params.id}:{i}`, track, x, y, w, ctx, {
+                index = album and (track.index ?? i) or nil,
+                showAlbum = not album,
+                playing = player.track and player.track.videoId == track.videoId,
+                context = { playlistId = c.playlistId, index = i },
+            })
+        end
+        y += 56
+    end
+    if token then
+        local key = `{params.kind}:{params.id}:more:{n}`
+        if y - R.viewBottom < 700 then
+            local t = token
+            local more = loader.get(key, function()
+                local items, next = api.collectionMore(t)
+                return { items, next }
+            end)
+            if more.status == "loading" then
+                media.spinner(win, x + w / 2, y + 20)
+                y += 50
+            end
+        end
+    end
+
+    -- Related shelves (other versions, more from the artist...).
+    y += 24
+    for s, shelf in c.related do
+        y += media.carousel(win, `collection:{params.id}:related:{s}`, shelf, x, y, w, ctx)
+    end
+    return (y + 20) - R.y
+end
+
+return collection

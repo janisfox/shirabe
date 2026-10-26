@@ -1,0 +1,126 @@
+-- Playback, done by YouTube Music's own player in the hidden page. This keeps
+-- state/player in sync with what the page reports, fills in the details of
+-- tracks the page moves on to by itself (autoplay, radio) and drives the OS
+-- media controls.
+
+local ui = require("@neyuki/ui")
+local bridge = require("services/ytm/bridge")
+local api = require("services/ytm/api")
+local images = require("services/images")
+local player = require("state/player")
+
+local playback = {}
+
+local detailsFor = nil      -- videoId whose details are being fetched / were fetched
+local sessionShown = nil    -- what the OS media session shows (to update only on change)
+
+-- Plays a track item; `context` = { playlistId?, index? } plays it inside an
+-- album / playlist so next / previous follow it.
+function playback.play(item: table, context: table?)
+    local playlistId = (context and context.playlistId) ?? item.playlistId
+    if item.videoId then
+        bridge.send("play", { videoId = item.videoId, playlistId = playlistId, params = item.endpoint and item.endpoint.params })
+        player.track = item
+        detailsFor = item.videoId
+    elseif playlistId then
+        bridge.send("play", { playlistId = playlistId })
+    end
+    player.context = playlistId
+    player.playing = true
+    player.position = 0
+    player.duration = item.duration ?? 0
+end
+
+-- Plays a normalized endpoint (artist Play / Radio buttons...).
+function playback.playEndpoint(e: table)
+    if e.kind == "watch" then
+        bridge.send("play", { videoId = e.videoId, playlistId = e.playlistId, params = e.params })
+        player.context = e.playlistId
+    elseif e.kind == "watchPlaylist" then
+        bridge.send("play", { playlistId = e.playlistId, params = e.params })
+        player.context = e.playlistId
+    end
+    player.playing = true
+end
+
+function playback.toggle()
+    if not player.track then return end
+    bridge.send(player.playing and "pause" or "resume")
+    player.playing = not player.playing
+end
+
+function playback.next() bridge.send("next") end
+function playback.prev() bridge.send("prev") end
+
+function playback.seek(seconds: number)
+    bridge.send("seek", { seconds = seconds })
+    player.position = seconds
+end
+
+-- The page's state messages (about 4 a second while playing).
+function playback.onState(s: table)
+    if not s.ready then return end
+    player.playing = s.playing == true or s.buffering == true
+    player.buffering = s.buffering == true
+    player.position = s.position ?? player.position
+    if (s.duration ?? 0) > 0 then player.duration = s.duration end
+    player.ad = s.ad == true
+    if not s.videoId then return end
+    if not player.track or player.track.videoId ~= s.videoId then
+        -- The page moved on by itself: show what it reports right away, then
+        -- fetch artwork, artists and like status.
+        player.track = { videoId = s.videoId, title = s.title ?? "", artists = { { name = s.author ?? "" } }, thumbnails = {} }
+    end
+    if detailsFor ~= s.videoId then
+        detailsFor = s.videoId
+        local videoId, playlistId = s.videoId, s.playlistId
+        task.spawn(function()
+            local watch = api.watch(videoId, playlistId)
+            local current = watch.current and watch.queue[watch.current]
+            if current and player.track and player.track.videoId == videoId then
+                current.videoId = videoId
+                player.track = current
+            end
+        end)
+    end
+end
+
+-- Once a frame: the OS media session (title, artist, artwork, position).
+function playback.update(win: any)
+    local track = player.track
+    if not track then return end
+    local cover = images.get(track.thumbnails, 300)
+    local names = {}
+    for _, a in track.artists ?? {} do table.insert(names, a.name) end
+    local artist = table.concat(names, ", ")
+    local key = `{track.videoId}|{player.playing}|{cover ~= nil}|{math.floor(player.duration)}`
+    -- Position is sent on state changes only; the OS extrapolates while playing.
+    if key ~= sessionShown then
+        sessionShown = key
+        ui.mediaSession({
+            title = track.title,
+            artist = artist,
+            album = track.album and track.album.name,
+            artwork = cover,
+            duration = player.duration > 0 and player.duration or nil,
+            position = player.position,
+            playing = player.playing,
+            window = win,
+        })
+    end
+end
+
+-- Media keys and OS media controls.
+function playback.handle(event: table)
+    if event.kind == "mediakey" then
+        if event.key == "playpause" or event.key == "play" or event.key == "pause" then playback.toggle()
+        elseif event.key == "next" then playback.next()
+        elseif event.key == "previous" then playback.prev()
+        elseif event.key == "stop" and player.playing then playback.toggle() end
+    elseif event.kind == "mediasession" and event.action == "seek" then
+        if event.position then playback.seek(event.position)
+        elseif event.offset then playback.seek(math.max(0, player.position + event.offset)) end
+    end
+end
+
+return playback

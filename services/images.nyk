@@ -1,0 +1,96 @@
+-- Artwork cache. `images.get(thumbnails, size)` returns a decoded Image (and
+-- how far its fade-in is, 0..1) or nil while it loads. Images are fetched by
+-- the YouTube Music page (services/ytm/api.image), a few at a time, and the
+-- least recently used are dropped beyond the cap.
+
+local ui = require("@neyuki/ui")
+local P = require("services/ytm/parse/common")
+local bridge = require("services/ytm/bridge")
+
+local images = {}
+
+local MAX_LOADING = 6
+local MAX_CACHED = 220
+local FADE = 0.25
+
+local cache = {}       -- url -> { image?, status, used, loadedAt }
+local queue = {}       -- urls waiting for a slot
+local loading = 0
+local count = 0
+
+local function evict()
+    while count > MAX_CACHED do
+        local oldestUrl, oldest = nil, math.huge
+        for url, entry in pairs(cache) do
+            if entry.status ~= "loading" and entry.used < oldest then oldestUrl, oldest = url, entry.used end
+        end
+        if not oldestUrl then return end
+        local entry = cache[oldestUrl]
+        if entry.image then entry.image:close() end
+        cache[oldestUrl] = nil
+        count -= 1
+    end
+end
+
+local function start(url: string)
+    local entry = cache[url]
+    loading += 1
+    entry.status = "loading"
+    entry.thread = task.spawn(function()
+        -- The URL is final here (sized by thumbnailUrl); fetch it as is.
+        entry.image = ui.decodeImage(bridge.image(url))
+        entry.status = "ready"
+        entry.loadedAt = os.clock()
+    end)
+end
+
+-- Starts queued loads while slots are free; notices failed ones.
+function images.pump()
+    for url, entry in pairs(cache) do
+        if entry.status == "loading" and entry.thread and coroutine.status(entry.thread) == "dead" then
+            entry.status = entry.image and "ready" or "error"
+        end
+    end
+    loading = 0
+    for _, entry in pairs(cache) do
+        if entry.status == "loading" then loading += 1 end
+    end
+    while loading < MAX_LOADING and #queue > 0 do
+        local url = table.remove(queue, 1)
+        if cache[url] and cache[url].status == "queued" then start(url) end
+    end
+end
+
+-- The image for a thumbnail list at about `size` logical pixels (pass the
+-- size times the window scale for sharp HiDPI art), or nil while loading.
+function images.get(thumbnails: {table}?, size: number): (any, number)
+    if not thumbnails or #thumbnails == 0 then return nil, 0 end
+    local url = P.thumbnailUrl(thumbnails, size)
+    if not url then return nil, 0 end
+    local entry = cache[url]
+    if not entry then
+        entry = { status = "queued", used = os.clock() }
+        cache[url] = entry
+        count += 1
+        table.insert(queue, url)
+        evict()
+        return nil, 0
+    end
+    entry.used = os.clock()
+    if entry.status == "ready" and entry.image then
+        return entry.image, math.min(1, (os.clock() - entry.loadedAt) / FADE)
+    end
+    return nil, 0
+end
+
+-- Whether images are still arriving or fading in (keeps frames coming).
+function images.busy(): boolean
+    if #queue > 0 then return true end
+    for _, entry in pairs(cache) do
+        if entry.status == "loading" then return true end
+        if entry.status == "ready" and os.clock() - entry.loadedAt < FADE then return true end
+    end
+    return false
+end
+
+return images

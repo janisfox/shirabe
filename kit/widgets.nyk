@@ -1,0 +1,172 @@
+-- Small reusable widgets: icon buttons, pill buttons and the text field.
+-- All of them draw immediately and return their input state.
+
+local ui = require("@neyuki/ui")
+local utf8 = require("@neyuki/utf8")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local tokens = require("theme/tokens")
+local icons = require("theme/icons")
+local fonts = require("theme/fonts")
+
+local C = tokens.color
+local widgets = {}
+
+-- A round-cornered square button holding an icon.
+--   options: active (draws the icon solid / brighter), color, hoverBg (false = no
+--   background on hover), iconSize, filled, radius
+function widgets.iconButton(target: any, id: any, icon: string, x: number, y: number, size: number, options: table?): table
+    local o = options ?? {}
+    local state = input.hit(id, x, y, size, size)
+    local h = anim.follow(`{id}:hover`, (state.hover and 1 or 0), tokens.motion.hoverRate)
+    local p = anim.follow(`{id}:press`, (state.held and 1 or 0), 30)
+    if o.hoverBg ~= false and h > 0.01 then
+        target:fillRect(x, y, size, size, ui.mixColor(0xFFFFFF00, C.hover, h), { radius = o.radius ?? tokens.radius.button })
+    end
+    local iconSize = (o.iconSize ?? (size * 0.55)) * (1 - p * 0.08)
+    local base = o.color ?? ((o.active and C.text) or C.textDim)
+    local color = ui.mixColor(base, C.text, h * 0.8)
+    icons.draw(target, icon, x + (size - iconSize) / 2, y + (size - iconSize) / 2, iconSize, color,
+        { filled = o.filled ?? o.active, width = o.width })
+    return state
+end
+
+-- A pill with a label (and optional leading icon). options.primary draws it
+-- light with dark text (the "Create playlist" style); options.selected the same
+-- for chips. Width follows the label.
+function widgets.pill(target: any, id: any, label: string, x: number, y: number, options: table?): (table, number)
+    local o = options ?? {}
+    local size = o.size ?? 13.5
+    local font = o.font ?? fonts.semibold
+    local tw = ui.measureText(label, { size = size, font = font })
+    local padX = o.padX ?? 14
+    local iconW = o.icon and (size + 8) or 0
+    local w = tw + padX * 2 + iconW
+    local h = o.height ?? 32
+    local state = input.hit(id, x, y, w, h)
+    local hv = anim.follow(`{id}:hover`, (state.hover and 1 or 0), tokens.motion.hoverRate)
+    local strong = o.primary or o.selected
+    local bg = strong and ui.mixColor(C.surfaceActive, 0xFFFFFFFF, hv * 0.5)
+        or ui.mixColor(C.surface, C.surfaceHover, hv)
+    local fg = strong and C.textOnActive or C.text
+    if not o.noBackground then
+        target:fillRect(x, y, w, h, bg, { radius = o.radius ?? tokens.radius.chip })
+    end
+    local tx = x + padX
+    if o.icon then
+        icons.draw(target, o.icon, tx - 2, y + (h - size - 2) / 2, size + 2, fg, { width = 2.2 })
+        tx += iconW
+    end
+    target:text(tx, y + (h - size * 1.25) / 2, label, { size = size, font = font, color = fg })
+    return state, w
+end
+
+-- SINGLE-LINE TEXT FIELD ------------------------------------------------------
+
+local focused = nil       -- id of the field with keyboard focus
+local fields = {}         -- id -> { text, preedit, caretBlink }
+
+function widgets.focus(id: any?, win: any?)
+    if focused == id then return end
+    focused = id
+    if win then win:setTextInput(id ~= nil) end
+end
+
+function widgets.focusedField(): any
+    return focused
+end
+
+function widgets.fieldText(id: any): string
+    return (fields[id] and fields[id].text) ?? ""
+end
+
+function widgets.setFieldText(id: any, text: string)
+    fields[id] = fields[id] ?? { text = "", preedit = "", blink = 0 }
+    fields[id].text = text
+end
+
+-- Removes the last character (a whole UTF-8 code point).
+local function dropLast(s: string): string
+    local n = utf8.len(s) ?? #s
+    if n == 0 then return s end
+    local cut = utf8.offset(s, n) ?? #s
+    return string.sub(s, 1, cut - 1)
+end
+
+-- Draws a text field and, while it has focus, applies typing, IME
+-- composition, backspace, ctrl+v and escape. Returns state with `changed`
+-- and `submitted` (enter) flags.
+--   options: placeholder, icon, size, win (for IME / focus), radius
+function widgets.textField(target: any, id: any, x: number, y: number, w: number, h: number, options: table?): table
+    local o = options ?? {}
+    local f = fields[id] ?? { text = "", preedit = "", blink = 0 }
+    fields[id] = f
+    local state = input.hit(id, x, y, w, h, { cursor = "text" })
+    if state.press then
+        widgets.focus(id, o.win)
+    elseif input.pressed and focused == id then
+        widgets.focus(nil, o.win)   -- a press anywhere else ends editing
+    end
+    local has = focused == id
+    state.changed, state.submitted = false, false
+
+    if has then
+        for _, piece in input.text do
+            f.text ..= piece
+            state.changed = true
+        end
+        for _, e in input.ime do
+            if e.phase == "preedit" then f.preedit = e.text ?? "" else f.preedit = "" end
+        end
+        if input.key("backspace") and f.preedit == "" then
+            f.text = dropLast(f.text)
+            state.changed = true
+        end
+        if input.key("v", true) then
+            local clip = ui.clipboard.get()
+            if clip then
+                f.text ..= string.gsub(clip, "[\r\n]+", " ")
+                state.changed = true
+            end
+        end
+        if input.key("enter") then state.submitted = true end
+        if input.key("escape") then widgets.focus(nil, o.win) end
+        f.blink += anim.dt
+        anim.busy = true   -- keep the caret blinking
+    end
+
+    local hv = anim.follow(`{id}:hover`, ((state.hover or has) and 1 or 0), tokens.motion.hoverRate)
+    target:fillRect(x, y, w, h, ui.mixColor(C.surface, C.surfaceHover, hv), { radius = o.radius ?? tokens.radius.chip })
+    if has then
+        target:strokeRect(x + 0.5, y + 0.5, w - 1, h - 1, 0xFFFFFF40, { radius = o.radius ?? tokens.radius.chip, width = 1 })
+    end
+
+    local size = o.size ?? 13.5
+    local tx = x + 12
+    if o.icon then
+        icons.draw(target, o.icon, x + 10, y + (h - 16) / 2, 16, C.textDim, { width = 2.2 })
+        tx = x + 34
+    end
+    local ty = y + (h - size * 1.3) / 2
+    local shown = f.text .. f.preedit
+    target:pushClip(tx, y, w - (tx - x) - 8, h)
+    if shown == "" then
+        target:text(tx, ty, o.placeholder ?? "", { size = size, font = fonts.regular, color = C.textFaint })
+    else
+        target:text(tx, ty, shown, { size = size, font = fonts.regular, color = C.text })
+    end
+    local caretX = tx + (f.text == "" and 0 or (ui.measureText(f.text, { size = size, font = fonts.regular })))
+    if f.preedit ~= "" then
+        local pw = ui.measureText(f.preedit, { size = size, font = fonts.regular })
+        target:line(caretX, ty + size * 1.3, caretX + pw, ty + size * 1.3, C.text, { width = 1 })
+        caretX += pw
+    end
+    if has and (f.blink % 1.0) < 0.55 then
+        target:fillRect(caretX, ty + 1, 1.5, size * 1.2, C.text)
+    end
+    target:popClip()
+    if has and o.win then o.win:setTextInput(true, { x = caretX, y = y, w = 2, h = h }) end
+    return state
+end
+
+return widgets

@@ -1,0 +1,77 @@
+-- The navigation rail: Home / Search / Library at the top, settings and the
+-- account avatar at the bottom. The active item is marked by a highlight that
+-- slides between items.
+
+local ui = require("@neyuki/ui")
+local anim = require("kit/anim")
+local widgets = require("kit/widgets")
+local input = require("kit/input")
+local tokens = require("theme/tokens")
+local glass = require("theme/glass")
+local fonts = require("theme/fonts")
+local media = require("kit/media")
+
+local C = tokens.color
+local rail = {}
+
+rail.items = {
+    { page = "home", icon = "home", label = "Home" },
+    { page = "search", icon = "search", label = "Search" },
+    { page = "library", icon = "library", label = "Library" },
+}
+
+local BUTTON = 40
+
+-- `current` is the active page id; `navigate(page)` switches pages.
+-- `account` is { initial, signedIn, photo? } or nil; clicking the avatar
+-- calls `onAccount`.
+function rail.draw(win: any, R: table, current: string, navigate: (string) -> any, account: table?,
+    onAccount: () -> any, openSettings: () -> any)
+    -- Only the background is under the rail, and the tint is nearly opaque,
+    -- so a backdrop blur would cost a lot for no visible difference.
+    glass.panel(win, R.x, R.y, R.w, R.h, { radius = tokens.radius.panel, blur = 0 })
+
+    local bx = R.x + (R.w - BUTTON) / 2
+    local top = R.y + 12
+    local activeIndex = nil
+    for i, item in rail.items do
+        if item.page == current then activeIndex = i end
+    end
+
+    -- Sliding highlight behind the active item.
+    if activeIndex then
+        local targetY = top + (activeIndex - 1) * (BUTTON + 6)
+        local y = anim.follow("rail:pill", targetY, tokens.motion.pillRate)
+        win:fillRect(bx, y, BUTTON, BUTTON, 0xFFFFFF1C, { radius = tokens.radius.button })
+    end
+
+    for i, item in rail.items do
+        local y = top + (i - 1) * (BUTTON + 6)
+        local st = widgets.iconButton(win, `rail:{item.page}`, item.icon, bx, y, BUTTON,
+            { active = item.page == current, iconSize = 24, filled = true, hoverBg = item.page ~= current })
+        if st.click then navigate(item.page) end
+    end
+
+    -- Bottom: settings gear, then the account avatar.
+    local avatarY = R.y + R.h - BUTTON - 10
+    local gearY = avatarY - BUTTON - 6
+    if widgets.iconButton(win, "rail:settings", "settings", bx, gearY, BUTTON, { iconSize = 24, width = 2 }).click then
+        openSettings()
+    end
+
+    local st = input.hit("rail:account", bx, avatarY, BUTTON, BUTTON)
+    local hv = anim.follow("rail:account:hover", (st.hover and 1 or 0), tokens.motion.hoverRate)
+    local cx, cy = bx + BUTTON / 2, avatarY + BUTTON / 2
+    win:circle(cx, cy, 15 + hv, ui.mixColor(0x2A2A30FF, 0x3A3A44FF, hv))
+    local initial = (account and account.initial) ?? "?"
+    win:text(cx, cy - 9, initial, { size = 14, font = fonts.semibold, color = C.text, align = "center" })
+    if account and account.photo and #account.photo > 0 then
+        media.art(win, account.photo, cx - 15 - hv, cy - 15 - hv, 30 + hv * 2, 30 + hv * 2, { round = true })
+    end
+    local online = account and account.signedIn
+    win:circle(cx + 11, cy + 11, 4.5, 0x0A0A0BFF)
+    win:circle(cx + 11, cy + 11, 3, online and 0x2ECC71FF or 0x6B6B73FF)
+    if st.click then onAccount() end
+end
+
+return rail

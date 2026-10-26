@@ -1,0 +1,322 @@
+-- shirabe: a YouTube Music player. Entry point and frame loop.
+-- Run from this folder: `neyuki main.nyk` (assets are read relative to the
+-- working directory). Needs Neyuki >= 0.6.1 (shared module instances).
+
+local ui = require("@neyuki/ui")
+
+local tokens = require("theme/tokens")
+local fonts = require("theme/fonts")
+local logo = require("theme/logo")
+local background = require("theme/background")
+local glass = require("theme/glass")
+local input = require("kit/input")
+local anim = require("kit/anim")
+local widgets = require("kit/widgets")
+local media = require("kit/media")
+local settings = require("state/settings")
+local player = require("state/player")
+local session = require("state/session")
+local loader = require("state/loader")
+local playback = require("state/playback")
+local images = require("services/images")
+local bridge = require("services/ytm/bridge")
+local api = require("services/ytm/api")
+local layout = require("app/layout")
+local titlebar = require("app/titlebar")
+local rail = require("app/rail")
+local playerbar = require("app/playerbar")
+local router = require("app/router")
+local harness = require("dev/harness")
+
+local C = tokens.color
+
+-- SETUP ------------------------------------------------------------------
+
+local cfg = settings.load()
+fonts.load()
+logo.load("assets/logos/shirabe-mark-white.svg")
+background.reload(cfg.background)
+
+local win = ui.open({
+    title = "shirabe",
+    width = 1280,
+    height = 800,
+    decorations = false,
+    minWidth = 900,
+    minHeight = 600,
+    icon = "assets/logos/shirabe-icon-dark.png",
+})
+
+-- The YouTube Music page. SHIRABE_TEST_MUTE silences automated runs;
+-- SHIRABE_PROFILE points them at another web profile.
+session.start({ mute = os.getenv("SHIRABE_TEST_MUTE") ~= nil, profile = os.getenv("SHIRABE_PROFILE") })
+bridge.onState = playback.onState
+
+router.register("home", require("pages/home"))
+router.register("search", require("pages/search"))
+router.register("library", require("pages/library"))
+router.register("collection", require("pages/collection"))
+router.register("artist", require("pages/artist"))
+
+-- TOASTS -----------------------------------------------------------------
+
+local toast = { text = nil, until_ = 0 }
+
+local function showToast(text: string)
+    toast.text, toast.until_ = text, os.clock() + 2.8
+end
+
+local function drawToast(L: table)
+    local target = (toast.text and os.clock() < toast.until_) and 1 or 0
+    local p = anim.follow("toast", target, 12, 0)
+    if p < 0.01 or not toast.text then return end
+    local tw = ui.measureText(toast.text, { size = 13, font = fonts.medium })
+    local w, h = tw + 32, 36
+    local x = L.content.x + (L.content.w - w) / 2
+    local y = L.playerbar.y - h - 14 + (1 - p) * 10
+    win:pushOpacity(p)
+    glass.panel(win, x, y, w, h, { radius = 18, tint = 0x18181CEE })
+    win:text(x + 16, y + 10, toast.text, { size = 13, font = fonts.medium, color = C.text })
+    win:popOpacity()
+end
+
+-- NAVIGATION AND ACTIONS -----------------------------------------------------
+
+local ctx = { win = win, toast = showToast }
+
+local function navigate(page: string, params: table?)
+    widgets.focus(nil, win)
+    router.navigate(page, params, ctx)
+end
+
+-- Opens an item's page, or plays it when it is a track.
+function ctx.open(item: table)
+    local kind = item.kind
+    if media.isTrack(item) then
+        playback.play(item)
+    elseif kind == "album" then
+        navigate("collection", { kind = "album", id = item.browseId })
+    elseif kind == "playlist" or kind == "podcast" then
+        navigate("collection", { kind = "playlist", id = item.browseId ?? item.playlistId })
+    elseif kind == "artist" or kind == "user" then
+        navigate("artist", { id = item.artistId ?? item.browseId })
+    end
+end
+
+-- Plays an item: tracks directly (inside `context`), albums and playlists from
+-- their first track.
+function ctx.play(item: table, context: table?)
+    if media.isTrack(item) then
+        playback.play(item, context)
+        return
+    end
+    if item.playlistId then
+        playback.playEndpoint({ kind = "watchPlaylist", playlistId = item.playlistId })
+        return
+    end
+    local id = item.browseId
+    if not id then return end
+    task.spawn(function()
+        local c = (item.kind == "album") and api.album(id) or api.playlist(id)
+        if c.tracks[1] then playback.play(c.tracks[1], { playlistId = c.playlistId, index = 1 }) end
+    end)
+end
+
+ctx.playEndpoint = playback.playEndpoint
+
+local actions = {
+    toggle = playback.toggle,
+    next = playback.next,
+    prev = playback.prev,
+    seek = playback.seek,
+    like = function()
+        local track = player.track
+        if not track or not track.videoId then return end
+        local status = (track.likeStatus == "LIKE") and "INDIFFERENT" or "LIKE"
+        track.likeStatus = status
+        local videoId = track.videoId
+        task.spawn(function() api.rate(videoId, status) end)
+        loader.forgetPrefix("playlist:LM")
+    end,
+    shuffle = function() showToast("Shuffle and repeat arrive with the now-playing view (milestone 5).") end,
+    cycleRepeat = function() showToast("Shuffle and repeat arrive with the now-playing view (milestone 5).") end,
+    toggleLyrics = function() showToast("Lyrics arrive with the now-playing view (milestone 5).") end,
+    toggleQueue = function() showToast("The queue arrives with the now-playing view (milestone 5).") end,
+}
+
+local function openSettings()
+    showToast("Settings arrive in milestone 7. Tip: drop an image or GIF on the window to set the background.")
+end
+
+-- ACCOUNT SWITCHER -----------------------------------------------------------
+
+local accountMenu = false
+
+local function accountInfo(): table?
+    local a = session.account
+    if not a then return { initial = "?", signedIn = session.status == "ready" } end
+    return { initial = string.upper(string.sub(a.name, 1, 1)), signedIn = true, photo = a.photo }
+end
+
+local function drawAccountMenu(L: table)
+    local p = anim.follow("accountMenu", accountMenu and 1 or 0, 16, 0)
+    if p < 0.01 then return end
+    local list = session.accounts ?? {}
+    local w = 280
+    local h = 52 + math.max(1, #list) * 52 + (session.status == "signedOut" and 44 or 0)
+    local x = L.rail.x + L.rail.w + 10
+    local y = L.rail.y + L.rail.h - h + (1 - p) * 8
+    -- Clicks outside close it.
+    if input.pressed and not (input.mx >= x and input.mx < x + w and input.my >= y and input.my < y + h) then
+        accountMenu = false
+    end
+    win:pushOpacity(p)
+    glass.panel(win, x, y, w, h, { radius = 14, tint = 0x16161AF2, blur = 20 })
+    win:text(x + 16, y + 16, "Accounts", { size = 12, font = fonts.semibold, color = C.textFaint, letterSpacing = 0.5 })
+    local ry = y + 40
+    if session.status == "signedOut" then
+        local st = widgets.pill(win, "account:signin", "Sign in with Google", x + 16, ry, { primary = true })
+        if st.click then
+            accountMenu = false
+            session.signIn()
+        end
+    end
+    for i, a in list do
+        local st = input.hit(`account:{i}`, x + 6, ry, w - 12, 48)
+        if st.hover then win:fillRect(x + 6, ry, w - 12, 48, C.hover, { radius = 8 }) end
+        win:circle(x + 32, ry + 24, 16, 0x2A2A30FF)
+        win:text(x + 32, ry + 15, string.upper(string.sub(a.name, 1, 1)), { size = 13, font = fonts.semibold, color = C.text, align = "center" })
+        media.art(win, a.photo, x + 16, ry + 8, 32, 32, { round = true })
+        win:text(x + 58, ry + 7, a.name, { size = 14, font = fonts.semibold, color = C.text, maxWidth = w - 100, overflow = "ellipsis" })
+        win:text(x + 58, ry + 26, a.handle ?? a.byline ?? "", { size = 12, font = fonts.regular, color = C.textDim, maxWidth = w - 100, overflow = "ellipsis" })
+        if a.selected then win:circle(x + w - 26, ry + 24, 4, C.text) end
+        if st.click and not a.selected then
+            accountMenu = false
+            session.switchTo(a)
+            showToast(`Switching to {a.handle ?? a.name}…`)
+        end
+        ry += 52
+    end
+    win:popOpacity()
+end
+
+-- BACK BUTTON ------------------------------------------------------------------
+
+local function drawBack(L: table)
+    local p = anim.follow("back", router.canGoBack() and 1 or 0, 16, 0)
+    if p < 0.01 then return end
+    local x, y = L.content.x + 12, 6
+    win:pushOpacity(p)
+    local st = widgets.iconButton(win, "nav:back", "prev", x, y, 28, { iconSize = 13 })
+    win:popOpacity()
+    if st.click and p > 0.5 then router.back(ctx) end
+end
+
+navigate("home")
+titlebar.start()
+
+-- FRAME --------------------------------------------------------------------
+
+local lastCursor = nil
+
+local debugFrames = os.getenv("SHIRABE_DEBUG_FRAMES") ~= nil
+local frameCount = 0
+local function frame(events: {table}, dt: number): boolean
+    frameCount += 1
+    if debugFrames and frameCount % 30 == 1 then
+        print(`frame {frameCount} t={string.format("%.1f", os.clock())} status={session.status} page={router.current()}`)
+    end
+    anim.begin(dt)
+    input.begin(events)
+    images.pump()
+
+    for _, e in events do
+        if e.kind == "webview" then
+            session.handle(e)
+        elseif e.kind == "mediakey" or e.kind == "mediasession" then
+            playback.handle(e)
+        elseif e.kind == "dropfile" then
+            local path, err = background.adopt(e.path)
+            if path then
+                cfg.background.kind = "image"
+                cfg.background.path = path
+                settings.save()
+                background.reload(cfg.background)
+                local problem = background.error()
+                showToast(problem and `Could not load background: {problem}` or "Background updated")
+            else
+                showToast(`Not used as background: {err}`)
+            end
+        end
+    end
+
+    -- Global shortcuts.
+    if input.key("k", true) then navigate("search") widgets.focus("search:query", win) end
+    if input.key("1", true) then navigate("home") end
+    if input.key("2", true) then navigate("search") end
+    if input.key("3", true) then navigate("library") end
+    if input.key(",", true) then openSettings() end
+    if input.key("f12") then harness.showStats = not harness.showStats end
+    if not widgets.focusedField() and (input.key("space") or input.key(" ")) then playback.toggle() end
+    for i, e in input.keys do
+        local mods = e.mods ?? {}
+        if (e.key == "arrowleft" and mods.alt) or (e.key == "backspace" and not widgets.focusedField()) then
+            table.remove(input.keys, i)
+            router.back(ctx)
+            break
+        end
+    end
+    if input.key("escape") then accountMenu = false end
+
+    local w, h = win:size()
+    local L = layout(w, h)
+
+    local animating = background.draw(win, w, h, dt, cfg.background)
+    local onEdge = titlebar.handleEdges(win, L)
+    router.draw(win, L.content, ctx)
+    drawBack(L)
+    rail.draw(win, L.rail, router.current() ?? "home", navigate, accountInfo(),
+        function() accountMenu = not accountMenu end, openSettings)
+    playerbar.draw(win, L.playerbar, player, actions)
+    drawAccountMenu(L)
+    drawToast(L)
+    titlebar.draw(win, L, onEdge)
+    if harness.showStats then harness.drawStats(win, L.content.x + 8, L.content.h - 30) end
+    playback.update(win)
+
+    input.finish()
+    if input.cursor ~= lastCursor then
+        win:setCursor(input.cursor)
+        lastCursor = input.cursor
+    end
+    harness.after(win, dt, navigate)
+    -- The close button (or a dev run) may have closed the window.
+    if not win:isOpen() then return false end
+    win:present()
+    return animating or anim.busy or harness.showStats or harness.active or images.busy() or loader.busy()
+        or player.playing
+end
+
+-- The loop. ui.run waits a whole frame for events *before* each frame's work,
+-- which caps animations at 1 / (16.7 ms + work); this waits only for what is
+-- left of the frame budget while something moves, and up to a second (or the
+-- next event) while idle. Background tasks and web views are pumped by poll.
+local FRAME = 1 / 60
+local last = os.clock()
+local busy = true
+while win:isOpen() do
+    local spent = os.clock() - last
+    local events = ui.poll(busy and math.max(0, FRAME - spent) or 0.5)
+    for _, e in events do
+        if e.kind == "close" and e.window == win then win:close() end
+    end
+    if not win:isOpen() then break end
+    local now = os.clock()
+    local dt = now - last
+    last = now
+    for _, e in harness.events(win, dt) do table.insert(events, e) end
+    if not win:isOpen() then break end
+    local tweens = ui.update(dt)
+    busy = frame(events, dt) or tweens > 0 or #events > 0
+end
+bridge.close()
